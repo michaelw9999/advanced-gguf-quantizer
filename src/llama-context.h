@@ -54,7 +54,7 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
-    void synchronize();
+    LLAMA_API void synchronize();
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -380,6 +380,6 @@ private:
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };
 
-const ggml_tensor * llama_internal_get_logits_tensor(const llama_context * ctx);
-ggml_backend_t llama_internal_get_logits_backend(const llama_context * ctx);
-void llama_internal_set_selector_gpu_kld_active(llama_context * ctx, bool active);
+LLAMA_API const ggml_tensor * llama_internal_get_logits_tensor(const llama_context * ctx);
+LLAMA_API ggml_backend_t llama_internal_get_logits_backend(const llama_context * ctx);
+LLAMA_API void llama_internal_set_selector_gpu_kld_active(llama_context * ctx, bool active);

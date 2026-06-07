@@ -165,7 +165,8 @@ std::string display_path(const std::string & value) {
     const std::filesystem::path cwd = std::filesystem::current_path(ec);
     if (!ec) {
         std::filesystem::path rel = std::filesystem::relative(path, cwd, ec);
-        if (!ec && !rel.empty() && rel.native().find("..") != 0 && rel.string().size() < value.size()) {
+        const std::string rel_str = rel.string();
+        if (!ec && !rel.empty() && rel_str.find("..") != 0 && rel_str.size() < value.size()) {
             path = rel;
         }
     }

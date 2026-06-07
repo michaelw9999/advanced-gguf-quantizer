@@ -119,7 +119,7 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
-    llama_model_loader(
+    LLAMA_API llama_model_loader(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
@@ -168,7 +168,7 @@ struct llama_model_loader {
 
     enum llm_arch get_arch() const;
 
-    const llama_tensor_weight * get_weight(const char * name) const;
+    LLAMA_API const llama_tensor_weight * get_weight(const char * name) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;
 
@@ -186,12 +186,12 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
-    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+    LLAMA_API void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 
     // for backwards compatibility, does not support ggml-backend
-    void load_data_for(struct ggml_tensor * cur) const;
+    LLAMA_API void load_data_for(struct ggml_tensor * cur) const;
 
     // Returns false if cancelled by progress_callback
     bool load_all_data(
