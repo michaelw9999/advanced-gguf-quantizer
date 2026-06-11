@@ -99,6 +99,15 @@ using ggml_cuda_mxfp6_e2m3_quantize_eval_to_tensor_t = bool (*)(
     int64_t nrow, int64_t n_per_row, const float * qw,
     float header_weight_scale, float header_input_scale,
     nvfp4_cuda_eval_result * eval, cudaStream_t stream);
+using ggml_cuda_quantize_classic_impl_t = bool (*)(
+    int32_t type,
+    const float * x,
+    void * vy,
+    int64_t nrow,
+    int64_t n_per_row,
+    const float * qw,
+    int32_t rsf_mode,
+    cudaStream_t stream);
 using ggml_cuda_tensor_set_host_t = bool (*)(
     ggml_tensor * tensor, const void * src, size_t nbytes, cudaStream_t stream);
 using ggml_cuda_nvfp4_tensor_set_header_scales_t = bool (*)(
@@ -592,6 +601,25 @@ extern "C" bool mxfp6_e2m3_quantize_cuda_eval_to_tensor(
         header_weight_scale, header_input_scale, eval, nvfp4_resolve_stream(stream));
 }
 
+extern "C" bool ggml_cuda_quantize_classic(
+    int32_t type,
+    const float * x,
+    void * vy,
+    int64_t nrow,
+    int64_t n_per_row,
+    const float * qw,
+    int32_t rsf_mode,
+    void * stream) {
+    if (!nvfp4_cuda_available()) {
+        return false;
+    }
+    const auto fn = ggml_cuda_sym<ggml_cuda_quantize_classic_impl_t>("ggml_cuda_quantize_classic_impl");
+    if (!fn) {
+        return false;
+    }
+    return fn(type, x, vy, nrow, n_per_row, qw, rsf_mode, nvfp4_resolve_stream(stream));
+}
+
 extern "C" bool ggml_cuda_tensor_set_host(
     ggml_tensor * tensor, const void * src, size_t nbytes, void * stream) {
     if (!nvfp4_cuda_available()) {
@@ -861,6 +889,26 @@ extern "C" bool mxfp6_e2m3_quantize_cuda_eval_to_tensor(
     (void) x; (void) x_bf16; (void) tensor; (void) plane_index;
     (void) nrow; (void) n_per_row; (void) qw; (void) x_scale;
     (void) header_weight_scale; (void) header_input_scale; (void) stream;
+    return false;
+}
+
+extern "C" bool ggml_cuda_quantize_classic(
+    int32_t type,
+    const float * x,
+    void * vy,
+    int64_t nrow,
+    int64_t n_per_row,
+    const float * qw,
+    int32_t rsf_mode,
+    void * stream) {
+    (void) type;
+    (void) x;
+    (void) vy;
+    (void) nrow;
+    (void) n_per_row;
+    (void) qw;
+    (void) rsf_mode;
+    (void) stream;
     return false;
 }
 

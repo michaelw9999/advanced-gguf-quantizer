@@ -212,6 +212,15 @@ GGML_BACKEND_API bool mxfp6_e2m3_quantize_cuda_eval_to_tensor(
         int64_t nrow, int64_t n_per_row, const float * qw,
         float x_scale, float header_weight_scale, float header_input_scale,
         nvfp4_cuda_eval_result * eval, void * stream);
+GGML_BACKEND_API bool ggml_cuda_quantize_classic(
+        int32_t type,
+        const float * x,
+        void * vy,
+        int64_t nrow,
+        int64_t n_per_row,
+        const float * qw,
+        int32_t rsf_mode,
+        void * stream);
 GGML_BACKEND_API bool ggml_cuda_tensor_set_host(
         struct ggml_tensor * tensor, const void * src, size_t nbytes, void * stream);
 GGML_BACKEND_API bool ggml_cuda_nvfp4_tensor_set_header_scales(

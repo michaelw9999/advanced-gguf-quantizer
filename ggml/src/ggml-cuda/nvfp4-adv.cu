@@ -142,6 +142,15 @@ GGML_BACKEND_API bool ggml_cuda_mxfp6_e2m3_quantize_eval_to_tensor(
         float header_input_scale,
         nvfp4_cuda_eval_result * eval,
         cudaStream_t stream);
+GGML_BACKEND_API bool ggml_cuda_quantize_classic_impl(
+        int32_t type,
+        const float * x,
+        void * vy,
+        int64_t nrow,
+        int64_t n_per_row,
+        const float * qw,
+        int32_t rsf_mode,
+        cudaStream_t stream);
 GGML_BACKEND_API bool ggml_cuda_tensor_set_host_impl(
         ggml_tensor * tensor,
         const void * src,
@@ -357,6 +366,31 @@ static __global__ void ggml_cuda_mxfp6_e2m3_quantize_blocks_32(
         const float * qw,
         block_mxfp6_e2m3 * y,
         int64_t row_blocks);
+static __global__ void ggml_cuda_quantize_q4_K_blocks(
+        const float * x,
+        const float * qw,
+        block_q4_K * y,
+        int64_t row_blocks);
+static __global__ void ggml_cuda_quantize_q6_K_blocks(
+        const float * x,
+        const float * qw,
+        block_q6_K * y,
+        int64_t row_blocks);
+static __global__ void ggml_cuda_quantize_q2_K_blocks(
+        const float * x,
+        const float * qw,
+        block_q2_K * y,
+        int64_t row_blocks);
+static __global__ void ggml_cuda_quantize_q3_K_blocks(
+        const float * x,
+        const float * qw,
+        block_q3_K * y,
+        int64_t row_blocks);
+static __global__ void ggml_cuda_quantize_q5_K_blocks(
+        const float * x,
+        const float * qw,
+        block_q5_K * y,
+        int64_t row_blocks);
 static __global__ void ggml_cuda_mxfp6_e2m3_pack_tiles_832(
         const block_mxfp6_e2m3 * x,
         tile_mxfp6_e2m3 * y,
@@ -399,6 +433,31 @@ static void nvfp4_cuda_log_failure(const char * stage, cudaError_t err) {
                 (int) mem_err);
         }
     }
+}
+
+static bool nvfp4_cuda_allocation_has_headroom(size_t need, size_t releasable, const char * stage) {
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    const cudaError_t err = cudaMemGetInfo(&free_mem, &total_mem);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        return true;
+    }
+
+    const size_t reserve = std::max<size_t>(total_mem / 64, (size_t) 128 * 1024 * 1024);
+    if (free_mem + releasable <= need + reserve) {
+        GGML_LOG_WARN(
+            "%s: stage=%s skipped allocation: need=%.2f MiB releasable=%.2f MiB cuda_mem_free=%.2f GiB reserve=%.2f MiB cuda_mem_total=%.2f GiB\n",
+            __func__,
+            stage,
+            (double) need / (1024.0 * 1024.0),
+            (double) releasable / (1024.0 * 1024.0),
+            (double) free_mem / (1024.0 * 1024.0 * 1024.0),
+            (double) reserve / (1024.0 * 1024.0),
+            (double) total_mem / (1024.0 * 1024.0 * 1024.0));
+        return false;
+    }
+    return true;
 }
 
 static inline void nvfp4_cuda_resolve_cfg(
@@ -460,6 +519,12 @@ static inline bool ggml_cuda_nvfp4_launch_kernel(
     return true;
 }
 
+static void ggml_cuda_nvfp4_reclaim_classic_cache();
+
+static inline bool nvfp4_cuda_stage_uses_classic_cache(const char * stage) {
+    return stage != nullptr && std::strstr(stage, "classic") != nullptr;
+}
+
 static inline bool ggml_cuda_nvfp4_ensure_buf(void ** buf, size_t * cap, size_t need, const char * stage) {
     if (need == 0) {
         return true;
@@ -467,17 +532,54 @@ static inline bool ggml_cuda_nvfp4_ensure_buf(void ** buf, size_t * cap, size_t 
     if (*cap >= need && *buf != nullptr) {
         return true;
     }
+
+    if (!nvfp4_cuda_allocation_has_headroom(need, *buf != nullptr ? *cap : 0, stage)) {
+        if (nvfp4_cuda_stage_uses_classic_cache(stage)) {
+            return false;
+        }
+        ggml_cuda_nvfp4_reclaim_classic_cache();
+        if (!nvfp4_cuda_allocation_has_headroom(need, *buf != nullptr ? *cap : 0, stage)) {
+            return false;
+        }
+    }
+
+    void * new_buf = nullptr;
+    cudaError_t err = cudaMalloc(&new_buf, need);
+    if (err == cudaSuccess) {
+        if (*buf != nullptr) {
+            cudaFree(*buf);
+        }
+        *buf = new_buf;
+        *cap = need;
+        return true;
+    }
+
+    cudaGetLastError();
+    if (!nvfp4_cuda_stage_uses_classic_cache(stage)) {
+        ggml_cuda_nvfp4_reclaim_classic_cache();
+        err = cudaMalloc(&new_buf, need);
+        if (err == cudaSuccess) {
+            if (*buf != nullptr) {
+                cudaFree(*buf);
+            }
+            *buf = new_buf;
+            *cap = need;
+            return true;
+        }
+        cudaGetLastError();
+    }
     if (*buf != nullptr) {
         cudaFree(*buf);
         *buf = nullptr;
         *cap = 0;
+        err = cudaMalloc(&new_buf, need);
     }
-    const cudaError_t err = cudaMalloc(buf, need);
     if (err != cudaSuccess) {
         nvfp4_cuda_log_failure(stage, err);
         cudaGetLastError();
         return false;
     }
+    *buf = new_buf;
     *cap = need;
     return true;
 }
@@ -624,6 +726,25 @@ struct mxfp6_e2m3_cuda_quant_tls {
     }
 };
 
+struct classic_cuda_quant_tls {
+    float * d_x_buf = nullptr;
+    size_t d_x_cap = 0;
+    float * d_qw_buf = nullptr;
+    size_t d_qw_cap = 0;
+    void * d_y_buf = nullptr;
+    size_t d_y_cap = 0;
+
+    void reset() {
+        ggml_cuda_nvfp4_release_typed_buf(&d_x_buf, &d_x_cap);
+        ggml_cuda_nvfp4_release_typed_buf(&d_qw_buf, &d_qw_cap);
+        ggml_cuda_nvfp4_release_buf(&d_y_buf, &d_y_cap);
+    }
+
+    ~classic_cuda_quant_tls() {
+        reset();
+    }
+};
+
 struct nvfp4_cuda_kld_tls {
     struct base_cache_entry {
         const uint16_t * host = nullptr;
@@ -674,8 +795,13 @@ static thread_local nvfp4_cuda_stream_tls      g_nvfp4_cuda_stream_tls;
 static thread_local nvfp4_cuda_autotune_tls   g_nvfp4_cuda_autotune_tls;
 static thread_local nvfp4_cuda_quant_tls      g_nvfp4_cuda_quant_tls;
 static thread_local mxfp6_e2m3_cuda_quant_tls g_mxfp6_e2m3_cuda_quant_tls;
+static thread_local classic_cuda_quant_tls    g_classic_cuda_quant_tls;
 static thread_local nvfp4_cuda_kld_tls        g_nvfp4_cuda_kld_tls;
 static std::atomic<int> g_nvfp4_cuda_autotune_threads{0};
+
+static void ggml_cuda_nvfp4_reclaim_classic_cache() {
+    g_classic_cuda_quant_tls.reset();
+}
 
 extern "C" void ggml_cuda_nvfp4_set_autotune_threads(int32_t n_threads) {
     g_nvfp4_cuda_autotune_threads.store(std::max<int32_t>(0, n_threads), std::memory_order_release);
@@ -685,6 +811,7 @@ extern "C" void ggml_cuda_nvfp4_clear_thread_cache() {
     g_nvfp4_cuda_autotune_tls.reset();
     g_nvfp4_cuda_quant_tls.reset();
     g_mxfp6_e2m3_cuda_quant_tls.reset();
+    g_classic_cuda_quant_tls.reset();
     g_nvfp4_cuda_kld_tls.reset();
     g_nvfp4_cuda_stream_tls.reset();
 }
@@ -1934,6 +2061,1247 @@ static __global__ void ggml_cuda_mxfp6_e2m3_pack_tiles_832(
     out->lane[lane][2] = mxfp6_e2m3_cuda_u32_from_bytes(packed, 8);
 }
 
+static __device__ __forceinline__ int classic_cuda_nearest_int(float fval) {
+    float val = fval + 12582912.f;
+    return (__float_as_int(val) & 0x007fffff) - 0x00400000;
+}
+
+static __device__ __forceinline__ int classic_cuda_clamp_int(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static __device__ __forceinline__ void classic_cuda_get_scale_min_k4(
+        int j,
+        const uint8_t * q,
+        uint8_t * d,
+        uint8_t * m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static __device__ float classic_cuda_make_qkx2_quants_32_15(
+        const float * x,
+        const float * weights,
+        uint8_t * L,
+        float * the_min,
+        uint8_t * Laux) {
+    float min = x[0];
+    float max = x[0];
+    float sum_w = weights[0];
+    float sum_x = sum_w * x[0];
+#pragma unroll
+    for (int i = 1; i < 32; ++i) {
+        if (x[i] < min) {
+            min = x[i];
+        }
+        if (x[i] > max) {
+            max = x[i];
+        }
+        const float w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if (min > 0.0f) {
+        min = 0.0f;
+    }
+    if (max == min) {
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            L[i] = 0;
+        }
+        *the_min = -min;
+        return 0.0f;
+    }
+
+    float iscale = 15.0f / (max - min);
+    float scale = 1.0f / iscale;
+    float best_error = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        const int l = classic_cuda_clamp_int(classic_cuda_nearest_int(iscale * (x[i] - min)), 0, 15);
+        L[i] = (uint8_t) l;
+        const float diff = scale * (float) l + min - x[i];
+        best_error += weights[i] * diff * diff;
+    }
+
+#pragma unroll
+    for (int is = 0; is <= 20; ++is) {
+        iscale = (-1.0f + 0.1f * is + 15.0f) / (max - min);
+        float sum_l = 0.0f;
+        float sum_l2 = 0.0f;
+        float sum_xl = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            const int l = classic_cuda_clamp_int(classic_cuda_nearest_int(iscale * (x[i] - min)), 0, 15);
+            Laux[i] = (uint8_t) l;
+            const float w = weights[i];
+            sum_l += w * l;
+            sum_l2 += w * l * l;
+            sum_xl += w * l * x[i];
+        }
+        const float D = sum_w * sum_l2 - sum_l * sum_l;
+        if (D > 0.0f) {
+            float this_scale = (sum_w * sum_xl - sum_x * sum_l) / D;
+            float this_min   = (sum_l2 * sum_x - sum_l * sum_xl) / D;
+            if (this_min > 0.0f) {
+                this_min = 0.0f;
+                this_scale = sum_xl / sum_l2;
+            }
+            float cur_error = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                const float diff = this_scale * Laux[i] + this_min - x[i];
+                cur_error += weights[i] * diff * diff;
+            }
+            if (cur_error < best_error) {
+#pragma unroll
+                for (int i = 0; i < 32; ++i) {
+                    L[i] = Laux[i];
+                }
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    return scale;
+}
+
+template<int N, int NMAX, int NSTEP, bool USE_MAD>
+static __device__ float classic_cuda_make_qkx2_quants_fixed(
+        const float * x,
+        const float * weights,
+        uint8_t * L,
+        float * the_min,
+        uint8_t * Laux,
+        float rmin,
+        float rdelta) {
+    float min = x[0];
+    float max = x[0];
+    float sum_w = weights[0];
+    float sum_x = sum_w * x[0];
+#pragma unroll
+    for (int i = 1; i < N; ++i) {
+        if (x[i] < min) {
+            min = x[i];
+        }
+        if (x[i] > max) {
+            max = x[i];
+        }
+        const float w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if (min > 0.0f) {
+        min = 0.0f;
+    }
+    if (max == min) {
+#pragma unroll
+        for (int i = 0; i < N; ++i) {
+            L[i] = 0;
+        }
+        *the_min = -min;
+        return 0.0f;
+    }
+
+    float iscale = (float) ((double) NMAX / ((double) max - (double) min));
+    float scale = (float) (1.0 / (double) iscale);
+    float best_error = 0.0f;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        const int l = classic_cuda_clamp_int(classic_cuda_nearest_int(iscale * (x[i] - min)), 0, NMAX);
+        L[i] = (uint8_t) l;
+        float diff = scale * (float) l + min - x[i];
+        diff = USE_MAD ? fabsf(diff) : diff * diff;
+        best_error += weights[i] * diff;
+    }
+
+#pragma unroll
+    for (int is = 0; is <= NSTEP; ++is) {
+        iscale = (float) (((double) rmin + (double) rdelta * (double) is + (double) NMAX) / ((double) max - (double) min));
+        float sum_l = 0.0f;
+        float sum_l2 = 0.0f;
+        float sum_xl = 0.0f;
+#pragma unroll
+        for (int i = 0; i < N; ++i) {
+            const int l = classic_cuda_clamp_int(classic_cuda_nearest_int(iscale * (x[i] - min)), 0, NMAX);
+            Laux[i] = (uint8_t) l;
+            const float w = weights[i];
+            sum_l += w * l;
+            sum_l2 += w * l * l;
+            sum_xl += w * l * x[i];
+        }
+        const float D = sum_w * sum_l2 - sum_l * sum_l;
+        if (D > 0.0f) {
+            float this_scale = (float) (((double) sum_w * (double) sum_xl - (double) sum_x * (double) sum_l) / (double) D);
+            float this_min   = (float) (((double) sum_l2 * (double) sum_x - (double) sum_l * (double) sum_xl) / (double) D);
+            if (this_min > 0.0f) {
+                this_min = 0.0f;
+                this_scale = (float) ((double) sum_xl / (double) sum_l2);
+            }
+            float cur_error = 0.0f;
+#pragma unroll
+            for (int i = 0; i < N; ++i) {
+                float diff = this_scale * Laux[i] + this_min - x[i];
+                diff = USE_MAD ? fabsf(diff) : diff * diff;
+                cur_error += weights[i] * diff;
+            }
+            if (cur_error < best_error) {
+#pragma unroll
+                for (int i = 0; i < N; ++i) {
+                    L[i] = Laux[i];
+                }
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    return scale;
+}
+
+static __device__ float classic_cuda_make_qx_quants_16_32(
+        const float * x,
+        int8_t * L) {
+    float max = 0.0f;
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const float ax = fabsf(x[i]);
+        if (ax > amax) {
+            amax = ax;
+            max = x[i];
+        }
+    }
+    if (amax < 1e-15f) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            L[i] = 0;
+        }
+        return 0.0f;
+    }
+
+    float iscale = -32.0f / max;
+    float sumlx = 0.0f;
+    float suml2 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        int l = classic_cuda_nearest_int(iscale * x[i]);
+        l = classic_cuda_clamp_int(l, -32, 31);
+        L[i] = (int8_t) (l + 32);
+        const float w = x[i] * x[i];
+        sumlx += w * x[i] * l;
+        suml2 += w * l * l;
+    }
+
+    float scale = suml2 ? sumlx / suml2 : 0.0f;
+    float best = scale * sumlx;
+#pragma unroll
+    for (int is = -9; is <= 9; ++is) {
+        if (is == 0) {
+            continue;
+        }
+        iscale = -(32.0f + 0.1f * is) / max;
+        sumlx = 0.0f;
+        suml2 = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            int l = classic_cuda_nearest_int(iscale * x[i]);
+            l = classic_cuda_clamp_int(l, -32, 31);
+            const float w = x[i] * x[i];
+            sumlx += w * x[i] * l;
+            suml2 += w * l * l;
+        }
+        if (suml2 > 0.0f && sumlx * sumlx > best * suml2) {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int l = classic_cuda_nearest_int(iscale * x[i]);
+                l = classic_cuda_clamp_int(l, -32, 31);
+                L[i] = (int8_t) (l + 32);
+            }
+            scale = sumlx / suml2;
+            best = scale * sumlx;
+        }
+    }
+    return scale;
+}
+
+static __device__ float classic_cuda_make_qx_quants(
+        int n,
+        int nmax,
+        const float * x,
+        int8_t * L,
+        int rmse_type,
+        const float * qw) {
+    float max = 0.0f;
+    float amax = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float ax = fabsf(x[i]);
+        if (ax > amax) {
+            amax = ax;
+            max = x[i];
+        }
+    }
+    if (amax < 1e-15f) {
+        for (int i = 0; i < n; ++i) {
+            L[i] = 0;
+        }
+        return 0.0f;
+    }
+    float iscale = -(float) nmax / max;
+    bool return_early = false;
+    if (rmse_type < 0) {
+        rmse_type = -rmse_type;
+        return_early = true;
+    }
+    float sumlx = 0.0f;
+    float suml2 = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        int l = classic_cuda_nearest_int(iscale * x[i]);
+        l = classic_cuda_clamp_int(l, -nmax, nmax - 1);
+        L[i] = (int8_t) (l + nmax);
+        const float w = qw ? qw[i] :
+            rmse_type == 1 ? x[i] * x[i] :
+            rmse_type == 2 ? 1.0f :
+            rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+        sumlx += w * x[i] * l;
+        suml2 += w * l * l;
+    }
+    float scale = suml2 ? sumlx / suml2 : 0.0f;
+    if (return_early) {
+        return suml2 > 0.0f ? 0.5f * (scale + 1.0f / iscale) : 1.0f / iscale;
+    }
+    float best = scale * sumlx;
+    for (int is = -9; is <= 9; ++is) {
+        if (is == 0) {
+            continue;
+        }
+        iscale = -((float) nmax + 0.1f * is) / max;
+        sumlx = 0.0f;
+        suml2 = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            int l = classic_cuda_nearest_int(iscale * x[i]);
+            l = classic_cuda_clamp_int(l, -nmax, nmax - 1);
+            const float w = qw ? qw[i] :
+                rmse_type == 1 ? x[i] * x[i] :
+                rmse_type == 2 ? 1.0f :
+                rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+            sumlx += w * x[i] * l;
+            suml2 += w * l * l;
+        }
+        if (suml2 > 0.0f && sumlx * sumlx > best * suml2) {
+            for (int i = 0; i < n; ++i) {
+                int l = classic_cuda_nearest_int(iscale * x[i]);
+                l = classic_cuda_clamp_int(l, -nmax, nmax - 1);
+                L[i] = (int8_t) (l + nmax);
+            }
+            scale = sumlx / suml2;
+            best = scale * sumlx;
+        }
+    }
+    return scale;
+}
+
+static __device__ float classic_cuda_make_q3_quants_16_4(
+        const float * x,
+        int8_t * L) {
+    float max = 0.0f;
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const float ax = fabsf(x[i]);
+        if (ax > amax) {
+            amax = ax;
+            max = x[i];
+        }
+    }
+    if (amax < 1e-15f) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            L[i] = 0;
+        }
+        return 0.0f;
+    }
+    const int nmax = 4;
+    const float iscale = -(float) nmax / max;
+    float sumlx = 0.0f;
+    float suml2 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        int l = classic_cuda_nearest_int(iscale * x[i]);
+        l = classic_cuda_clamp_int(l, -nmax, nmax - 1);
+        L[i] = (int8_t) l;
+        const float w = x[i] * x[i];
+        sumlx += w * x[i] * l;
+        suml2 += w * l * l;
+    }
+    for (int itry = 0; itry < 5; ++itry) {
+        int n_changed = 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const float w = x[i] * x[i];
+            float slx = sumlx - w * x[i] * L[i];
+            if (slx > 0.0f) {
+                float sl2 = suml2 - w * L[i] * L[i];
+                int new_l = classic_cuda_nearest_int(x[i] * sl2 / slx);
+                new_l = classic_cuda_clamp_int(new_l, -nmax, nmax - 1);
+                if (new_l != L[i]) {
+                    slx += w * x[i] * new_l;
+                    sl2 += w * new_l * new_l;
+                    if (sl2 > 0.0f && slx * slx * suml2 > sumlx * sumlx * sl2) {
+                        L[i] = (int8_t) new_l;
+                        sumlx = slx;
+                        suml2 = sl2;
+                        ++n_changed;
+                    }
+                }
+            }
+        }
+        if (!n_changed) {
+            break;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        L[i] += nmax;
+    }
+    return suml2 > 0.0f ? sumlx / suml2 : 0.0f;
+}
+
+static __device__ float classic_cuda_make_qkx2_quants(
+        int n,
+        int nmax,
+        const float * x,
+        const float * weights,
+        uint8_t * L,
+        float * the_min,
+        uint8_t * Laux,
+        float rmin,
+        float rdelta,
+        int nstep,
+        bool use_mad) {
+    float min = x[0];
+    float max = x[0];
+    float sum_w = weights[0];
+    float sum_x = sum_w * x[0];
+    for (int i = 1; i < n; ++i) {
+        if (x[i] < min) {
+            min = x[i];
+        }
+        if (x[i] > max) {
+            max = x[i];
+        }
+        const float w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if (min > 0.0f) {
+        min = 0.0f;
+    }
+    if (max == min) {
+        for (int i = 0; i < n; ++i) {
+            L[i] = 0;
+        }
+        *the_min = -min;
+        return 0.0f;
+    }
+    float iscale = (float) nmax / (max - min);
+    float scale = 1.0f / iscale;
+    float best_error = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const int l = classic_cuda_clamp_int(classic_cuda_nearest_int(iscale * (x[i] - min)), 0, nmax);
+        L[i] = (uint8_t) l;
+        float diff = scale * (float) l + min - x[i];
+        diff = use_mad ? fabsf(diff) : diff * diff;
+        best_error += weights[i] * diff;
+    }
+    if (nstep < 1) {
+        *the_min = -min;
+        return scale;
+    }
+    for (int is = 0; is <= nstep; ++is) {
+        iscale = (rmin + rdelta * is + (float) nmax) / (max - min);
+        float sum_l = 0.0f;
+        float sum_l2 = 0.0f;
+        float sum_xl = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            const int l = classic_cuda_clamp_int(classic_cuda_nearest_int(iscale * (x[i] - min)), 0, nmax);
+            Laux[i] = (uint8_t) l;
+            const float w = weights[i];
+            sum_l += w * l;
+            sum_l2 += w * l * l;
+            sum_xl += w * l * x[i];
+        }
+        const float D = sum_w * sum_l2 - sum_l * sum_l;
+        if (D > 0.0f) {
+            float this_scale = (sum_w * sum_xl - sum_x * sum_l) / D;
+            float this_min   = (sum_l2 * sum_x - sum_l * sum_xl) / D;
+            if (this_min > 0.0f) {
+                this_min = 0.0f;
+                this_scale = sum_xl / sum_l2;
+            }
+            float cur_error = 0.0f;
+            for (int i = 0; i < n; ++i) {
+                float diff = this_scale * Laux[i] + this_min - x[i];
+                diff = use_mad ? fabsf(diff) : diff * diff;
+                cur_error += weights[i] * diff;
+            }
+            if (cur_error < best_error) {
+                for (int i = 0; i < n; ++i) {
+                    L[i] = Laux[i];
+                }
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    return scale;
+}
+
+static __device__ float classic_cuda_make_qkx3_quants(
+        int n,
+        int nmax,
+        const float * x,
+        const float * weights,
+        uint8_t * L,
+        float * the_min,
+        uint8_t * Laux,
+        float rmin,
+        float rdelta,
+        int nstep,
+        bool use_mad) {
+    return classic_cuda_make_qkx2_quants(n, nmax, x, weights, L, the_min, Laux, rmin, rdelta, nstep, use_mad);
+}
+
+static __device__ float classic_cuda_make_qp_quants(
+        int n,
+        int nmax,
+        const float * x,
+        uint8_t * L,
+        const float * quant_weights) {
+    float max = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        max = fmaxf(max, x[i]);
+    }
+    if (max < 1e-15f) {
+        for (int i = 0; i < n; ++i) {
+            L[i] = 0;
+        }
+        return 0.0f;
+    }
+    float iscale = (float) nmax / max;
+    for (int i = 0; i < n; ++i) {
+        L[i] = (uint8_t) classic_cuda_nearest_int(iscale * x[i]);
+    }
+    float scale = 1.0f / iscale;
+    float best_mse = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const float diff = x[i] - scale * L[i];
+        best_mse += quant_weights[i] * diff * diff;
+    }
+    for (int is = -4; is <= 4; ++is) {
+        if (is == 0) {
+            continue;
+        }
+        const float iscale_is = (0.1f * is + (float) nmax) / max;
+        const float scale_is = 1.0f / iscale_is;
+        float mse = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            int l = classic_cuda_nearest_int(iscale_is * x[i]);
+            l = l < nmax ? l : nmax;
+            const float diff = x[i] - scale_is * l;
+            mse += quant_weights[i] * diff * diff;
+        }
+        if (mse < best_mse) {
+            best_mse = mse;
+            iscale = iscale_is;
+        }
+    }
+    float sumlx = 0.0f;
+    float suml2 = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        int l = classic_cuda_nearest_int(iscale * x[i]);
+        l = l < nmax ? l : nmax;
+        L[i] = (uint8_t) l;
+        const float w = quant_weights[i];
+        sumlx += w * x[i] * l;
+        suml2 += w * l * l;
+    }
+    for (int itry = 0; itry < 5; ++itry) {
+        int n_changed = 0;
+        for (int i = 0; i < n; ++i) {
+            const float w = quant_weights[i];
+            float slx = sumlx - w * x[i] * L[i];
+            float sl2 = suml2 - w * L[i] * L[i];
+            if (slx > 0.0f && sl2 > 0.0f) {
+                int new_l = classic_cuda_nearest_int(x[i] * sl2 / slx);
+                new_l = new_l < nmax ? new_l : nmax;
+                if (new_l != L[i]) {
+                    slx += w * x[i] * new_l;
+                    sl2 += w * new_l * new_l;
+                    if (slx * slx * suml2 > sumlx * sumlx * sl2) {
+                        L[i] = (uint8_t) new_l;
+                        sumlx = slx;
+                        suml2 = sl2;
+                        ++n_changed;
+                    }
+                }
+            }
+        }
+        if (!n_changed) {
+            break;
+        }
+    }
+    return suml2 > 0.0f ? sumlx / suml2 : 0.0f;
+}
+
+static __global__ void ggml_cuda_quantize_q2_K_blocks(
+        const float * x,
+        const float * qw,
+        block_q2_K * y,
+        int64_t row_blocks) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int64_t ib = (int64_t) blockIdx.x;
+    const int64_t block_in_row = ib % row_blocks;
+    const int64_t row = ib / row_blocks;
+    const float * xb = x + row * row_blocks * QK_K + block_in_row * QK_K;
+    const float * qwb = qw ? (qw + block_in_row * QK_K) : nullptr;
+    block_q2_K * yb = y + ib;
+
+    uint8_t L[QK_K];
+    uint8_t Laux[16];
+    float weights[16];
+    float mins[QK_K / 16];
+    float scales[QK_K / 16];
+    float max_scale = 0.0f;
+    float max_min = 0.0f;
+
+    if (qwb == nullptr) {
+#pragma unroll
+        for (int j = 0; j < QK_K / 16; ++j) {
+#pragma unroll
+            for (int l = 0; l < 16; ++l) {
+                weights[l] = fabsf(xb[16 * j + l]);
+            }
+            scales[j] = classic_cuda_make_qkx2_quants_fixed<16, 3, 15, true>(
+                    xb + 16 * j, weights, L + 16 * j, &mins[j], Laux, -0.5f, 0.1f);
+            if (scales[j] > max_scale) {
+                max_scale = scales[j];
+            }
+            if (mins[j] > max_min) {
+                max_min = mins[j];
+            }
+        }
+
+        if (max_scale > 0.0f) {
+            const float iscale = 15.0f / max_scale;
+#pragma unroll
+            for (int j = 0; j < QK_K / 16; ++j) {
+                yb->scales[j] = (uint8_t) classic_cuda_nearest_int(iscale * scales[j]);
+            }
+            yb->data.d = __float2half(max_scale / 15.0f);
+        } else {
+#pragma unroll
+            for (int j = 0; j < QK_K / 16; ++j) {
+                yb->scales[j] = 0;
+            }
+            yb->data.d = __float2half(0.0f);
+        }
+        if (max_min > 0.0f) {
+            const float iscale = 15.0f / max_min;
+#pragma unroll
+            for (int j = 0; j < QK_K / 16; ++j) {
+                const int l = classic_cuda_nearest_int(iscale * mins[j]);
+                yb->scales[j] |= (uint8_t) (l << 4);
+            }
+            yb->data.dmin = __float2half(max_min / 15.0f);
+        } else {
+            yb->data.dmin = __float2half(0.0f);
+        }
+    } else {
+        uint8_t Ls[QK_K / 16];
+        uint8_t Lm[QK_K / 16];
+        float sw[QK_K / 16];
+        float sumx2 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_K; ++j) {
+            sumx2 += xb[j] * xb[j];
+        }
+        const float sigma2 = sumx2 / QK_K;
+#pragma unroll
+        for (int j = 0; j < QK_K / 16; ++j) {
+            float sumw = 0.0f;
+#pragma unroll
+            for (int l = 0; l < 16; ++l) {
+                weights[l] = qwb[16 * j + l] * sqrtf(sigma2 + xb[16 * j + l] * xb[16 * j + l]);
+                sumw += weights[l];
+            }
+            sw[j] = sumw;
+            scales[j] = classic_cuda_make_qkx3_quants(16, 3, xb + 16 * j, weights, L + 16 * j, &mins[j], Laux, -0.9f, 0.05f, 36, false);
+        }
+        const float dm = classic_cuda_make_qp_quants(QK_K / 16, 15, scales, Ls, sw);
+        const float mm = classic_cuda_make_qp_quants(QK_K / 16, 15, mins, Lm, sw);
+        yb->data.d = __float2half(dm);
+        yb->data.dmin = __float2half(mm);
+#pragma unroll
+        for (int j = 0; j < QK_K / 16; ++j) {
+            yb->scales[j] = Ls[j] | (Lm[j] << 4);
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < QK_K / 16; ++j) {
+        const float d = __half2float(yb->data.d) * (yb->scales[j] & 0xF);
+        if (d == 0.0f) {
+            continue;
+        }
+        const float dm = __half2float(yb->data.dmin) * (yb->scales[j] >> 4);
+#pragma unroll
+        for (int ii = 0; ii < 16; ++ii) {
+            int l = classic_cuda_nearest_int((xb[16 * j + ii] + dm) / d);
+            l = classic_cuda_clamp_int(l, 0, 3);
+            L[16 * j + ii] = (uint8_t) l;
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < QK_K; j += 128) {
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            yb->qs[j / 4 + l] = L[j + l] | (L[j + l + 32] << 2) | (L[j + l + 64] << 4) | (L[j + l + 96] << 6);
+        }
+    }
+}
+
+static __global__ void ggml_cuda_quantize_q3_K_blocks(
+        const float * x,
+        const float * qw,
+        block_q3_K * y,
+        int64_t row_blocks) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int64_t ib = (int64_t) blockIdx.x;
+    const int64_t block_in_row = ib % row_blocks;
+    const int64_t row = ib / row_blocks;
+    const float * xb = x + row * row_blocks * QK_K + block_in_row * QK_K;
+    const float * qwb = qw ? (qw + block_in_row * QK_K) : nullptr;
+    block_q3_K * yb = y + ib;
+
+    int8_t L[QK_K];
+    float scales[QK_K / 16];
+
+    if (qwb == nullptr) {
+        float max_scale = 0.0f;
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_K / 16; ++j) {
+            scales[j] = classic_cuda_make_q3_quants_16_4(xb + 16 * j, L + 16 * j);
+            const float scale = fabsf(scales[j]);
+            if (scale > amax) {
+                amax = scale;
+                max_scale = scales[j];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 12; ++j) {
+            yb->scales[j] = 0;
+        }
+        if (max_scale != 0.0f) {
+            const float iscale = -32.0f / max_scale;
+#pragma unroll
+            for (int j = 0; j < QK_K / 16; ++j) {
+                int l = classic_cuda_nearest_int(iscale * scales[j]);
+                l = classic_cuda_clamp_int(l, -32, 31) + 32;
+                if (j < 8) {
+                    yb->scales[j] = l & 0xF;
+                } else {
+                    yb->scales[j - 8] |= ((l & 0xF) << 4);
+                }
+                l >>= 4;
+                yb->scales[j % 4 + 8] |= (l << (2 * (j / 4)));
+            }
+            yb->d = __float2half(1.0f / iscale);
+        } else {
+            yb->d = __float2half(0.0f);
+        }
+    } else {
+        float weight[16];
+        float sw[QK_K / 16];
+        int8_t Ls[QK_K / 16];
+        float sumx2 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_K; ++j) {
+            sumx2 += xb[j] * xb[j];
+        }
+        const float sigma2 = 2.0f * sumx2 / QK_K;
+#pragma unroll
+        for (int j = 0; j < QK_K / 16; ++j) {
+            float sumw = 0.0f;
+#pragma unroll
+            for (int l = 0; l < 16; ++l) {
+                weight[l] = qwb[16 * j + l] * sqrtf(sigma2 + xb[16 * j + l] * xb[16 * j + l]);
+                sumw += weight[l];
+            }
+            sw[j] = sumw;
+            scales[j] = classic_cuda_make_qx_quants(16, 4, xb + 16 * j, L + 16 * j, 1, weight);
+        }
+#pragma unroll
+        for (int j = 0; j < 12; ++j) {
+            yb->scales[j] = 0;
+        }
+        const float d_block = classic_cuda_make_qx_quants(QK_K / 16, 32, scales, Ls, 1, sw);
+#pragma unroll
+        for (int j = 0; j < QK_K / 16; ++j) {
+            int l = Ls[j];
+            if (j < 8) {
+                yb->scales[j] = l & 0xF;
+            } else {
+                yb->scales[j - 8] |= ((l & 0xF) << 4);
+            }
+            l >>= 4;
+            yb->scales[j % 4 + 8] |= (l << (2 * (j / 4)));
+        }
+        yb->d = __float2half(d_block);
+    }
+
+#pragma unroll
+    for (int j = 0; j < QK_K / 16; ++j) {
+        int8_t sc = j < 8 ? yb->scales[j] & 0xF : yb->scales[j - 8] >> 4;
+        sc = (sc | (((yb->scales[8 + j % 4] >> (2 * (j / 4))) & 3) << 4)) - 32;
+        const float d = __half2float(yb->d) * sc;
+        if (d == 0.0f) {
+            continue;
+        }
+#pragma unroll
+        for (int ii = 0; ii < 16; ++ii) {
+            int l = classic_cuda_nearest_int(xb[16 * j + ii] / d);
+            l = classic_cuda_clamp_int(l, -4, 3);
+            L[16 * j + ii] = (int8_t) (l + 4);
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < QK_K / 8; ++j) {
+        yb->hmask[j] = 0;
+    }
+    int m = 0;
+    uint8_t hm = 1;
+#pragma unroll
+    for (int j = 0; j < QK_K; ++j) {
+        if (L[j] > 3) {
+            yb->hmask[m] |= hm;
+            L[j] -= 4;
+        }
+        if (++m == QK_K / 8) {
+            m = 0;
+            hm <<= 1;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < QK_K; j += 128) {
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            yb->qs[j / 4 + l] = L[j + l] | (L[j + l + 32] << 2) | (L[j + l + 64] << 4) | (L[j + l + 96] << 6);
+        }
+    }
+}
+
+static __global__ void ggml_cuda_quantize_q4_K_blocks(
+        const float * x,
+        const float * qw,
+        block_q4_K * y,
+        int64_t row_blocks) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int64_t ib = (int64_t) blockIdx.x;
+    const int64_t block_in_row = ib % row_blocks;
+    const int64_t row = ib / row_blocks;
+    const float * xb = x + row * row_blocks * QK_K + block_in_row * QK_K;
+    const float * qwb = qw ? (qw + block_in_row * QK_K) : nullptr;
+    block_q4_K * yb = y + ib;
+
+    uint8_t L[QK_K];
+    uint8_t Laux[32];
+    float weights[32];
+    float mins[QK_K / 32];
+    float scales[QK_K / 32];
+    float max_scale = 0.0f;
+    float max_min = 0.0f;
+
+    if (qwb == nullptr) {
+#pragma unroll
+        for (int j = 0; j < QK_K / 32; ++j) {
+            float sum_x2 = 0.0f;
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                const float v = xb[32 * j + l];
+                sum_x2 += v * v;
+            }
+            const float av_x = sqrtf(sum_x2 / 32.0f);
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                weights[l] = av_x + fabsf(xb[32 * j + l]);
+            }
+            scales[j] = classic_cuda_make_qkx2_quants_32_15(xb + 32 * j, weights, L + 32 * j, &mins[j], Laux);
+            if (scales[j] > max_scale) {
+                max_scale = scales[j];
+            }
+            if (mins[j] > max_min) {
+                max_min = mins[j];
+            }
+        }
+
+        const float inv_scale = max_scale > 0.0f ? 63.0f / max_scale : 0.0f;
+        const float inv_min   = max_min   > 0.0f ? 63.0f / max_min   : 0.0f;
+
+#pragma unroll
+        for (int j = 0; j < QK_K / 32; ++j) {
+            uint8_t ls = (uint8_t) classic_cuda_nearest_int(inv_scale * scales[j]);
+            uint8_t lm = (uint8_t) classic_cuda_nearest_int(inv_min * mins[j]);
+            ls = ls > 63 ? 63 : ls;
+            lm = lm > 63 ? 63 : lm;
+            if (j < 4) {
+                yb->scales[j] = ls;
+                yb->scales[j + 4] = lm;
+            } else {
+                yb->scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                yb->scales[j - 4] |= ((ls >> 4) << 6);
+                yb->scales[j - 0] |= ((lm >> 4) << 6);
+            }
+        }
+        yb->data.d = __float2half(max_scale / 63.0f);
+        yb->data.dmin = __float2half(max_min / 63.0f);
+    } else {
+        uint8_t Ls[QK_K / 32];
+        uint8_t Lm[QK_K / 32];
+        float sw[QK_K / 32];
+        float sum_x2 = 0.0f;
+#pragma unroll
+        for (int l = 0; l < QK_K; ++l) {
+            sum_x2 += xb[l] * xb[l];
+        }
+        const float sigma2 = 2.0f * sum_x2 / QK_K;
+#pragma unroll
+        for (int j = 0; j < QK_K / 32; ++j) {
+            float sumw = 0.0f;
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                weights[l] = qwb[32 * j + l] * sqrtf(sigma2 + xb[32 * j + l] * xb[32 * j + l]);
+                sumw += weights[l];
+            }
+            sw[j] = sumw;
+            scales[j] = classic_cuda_make_qkx3_quants(32, 15, xb + 32 * j, weights, L + 32 * j, &mins[j], Laux, -0.9f, 0.05f, 36, false);
+        }
+        const float d_block = classic_cuda_make_qp_quants(QK_K / 32, 63, scales, Ls, sw);
+        const float m_block = classic_cuda_make_qp_quants(QK_K / 32, 63, mins, Lm, sw);
+#pragma unroll
+        for (int j = 0; j < QK_K / 32; ++j) {
+            const uint8_t ls = Ls[j] > 63 ? 63 : Ls[j];
+            const uint8_t lm = Lm[j] > 63 ? 63 : Lm[j];
+            if (j < 4) {
+                yb->scales[j] = ls;
+                yb->scales[j + 4] = lm;
+            } else {
+                yb->scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                yb->scales[j - 4] |= ((ls >> 4) << 6);
+                yb->scales[j - 0] |= ((lm >> 4) << 6);
+            }
+        }
+        yb->data.d = __float2half(d_block);
+        yb->data.dmin = __float2half(m_block);
+    }
+
+#pragma unroll
+    for (int j = 0; j < QK_K / 32; ++j) {
+        uint8_t sc;
+        uint8_t m;
+        classic_cuda_get_scale_min_k4(j, yb->scales, &sc, &m);
+        const float d = __half2float(yb->data.d) * sc;
+        if (d == 0.0f) {
+            continue;
+        }
+        const float dm = __half2float(yb->data.dmin) * m;
+#pragma unroll
+        for (int ii = 0; ii < 32; ++ii) {
+            int l = classic_cuda_nearest_int((xb[32 * j + ii] + dm) / d);
+            l = classic_cuda_clamp_int(l, 0, 15);
+            L[32 * j + ii] = (uint8_t) l;
+        }
+    }
+
+    uint8_t * q = yb->qs;
+#pragma unroll
+    for (int j = 0; j < QK_K; j += 64) {
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            q[l] = L[j + l] | (L[j + l + 32] << 4);
+        }
+        q += 32;
+    }
+}
+
+static __global__ void ggml_cuda_quantize_q5_K_blocks(
+        const float * x,
+        const float * qw,
+        block_q5_K * y,
+        int64_t row_blocks) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int64_t ib = (int64_t) blockIdx.x;
+    const int64_t block_in_row = ib % row_blocks;
+    const int64_t row = ib / row_blocks;
+    const float * xb = x + row * row_blocks * QK_K + block_in_row * QK_K;
+    const float * qwb = qw ? (qw + block_in_row * QK_K) : nullptr;
+    block_q5_K * yb = y + ib;
+
+    uint8_t L[QK_K];
+    uint8_t Laux[32];
+    float weights[32];
+    float mins[QK_K / 32];
+    float scales[QK_K / 32];
+
+    if (qwb == nullptr) {
+        float max_scale = 0.0f;
+        float max_min = 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_K / 32; ++j) {
+            float sum_x2 = 0.0f;
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                const float v = xb[32 * j + l];
+                sum_x2 += v * v;
+            }
+            const float av_x = sqrtf(sum_x2 / 32.0f);
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                weights[l] = av_x + fabsf(xb[32 * j + l]);
+            }
+            scales[j] = classic_cuda_make_qkx2_quants_fixed<32, 31, 15, false>(
+                    xb + 32 * j, weights, L + 32 * j, &mins[j], Laux, -0.5f, 0.1f);
+            if (scales[j] > max_scale) {
+                max_scale = scales[j];
+            }
+            if (mins[j] > max_min) {
+                max_min = mins[j];
+            }
+        }
+
+        const float inv_scale = max_scale > 0.0f ? 63.0f / max_scale : 0.0f;
+        const float inv_min   = max_min   > 0.0f ? 63.0f / max_min   : 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_K / 32; ++j) {
+            uint8_t ls = (uint8_t) classic_cuda_nearest_int(inv_scale * scales[j]);
+            uint8_t lm = (uint8_t) classic_cuda_nearest_int(inv_min * mins[j]);
+            ls = ls > 63 ? 63 : ls;
+            lm = lm > 63 ? 63 : lm;
+            if (j < 4) {
+                yb->scales[j] = ls;
+                yb->scales[j + 4] = lm;
+            } else {
+                yb->scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                yb->scales[j - 4] |= ((ls >> 4) << 6);
+                yb->scales[j - 0] |= ((lm >> 4) << 6);
+            }
+        }
+        yb->data.d = __float2half(max_scale / 63.0f);
+        yb->data.dmin = __float2half(max_min / 63.0f);
+    } else {
+        uint8_t Ls[QK_K / 32];
+        uint8_t Lm[QK_K / 32];
+        float sw[QK_K / 32];
+        float sum_x2 = 0.0f;
+#pragma unroll
+        for (int l = 0; l < QK_K; ++l) {
+            sum_x2 += xb[l] * xb[l];
+        }
+        const float sigma2 = 2.0f * sum_x2 / QK_K;
+#pragma unroll
+        for (int j = 0; j < QK_K / 32; ++j) {
+            float sumw = 0.0f;
+#pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                weights[l] = qwb[32 * j + l] * sqrtf(sigma2 + xb[32 * j + l] * xb[32 * j + l]);
+                sumw += weights[l];
+            }
+            sw[j] = sumw;
+            scales[j] = classic_cuda_make_qkx3_quants(32, 31, xb + 32 * j, weights, L + 32 * j, &mins[j], Laux, -0.9f, 0.05f, 36, false);
+        }
+        const float d_block = classic_cuda_make_qp_quants(QK_K / 32, 63, scales, Ls, sw);
+        const float m_block = classic_cuda_make_qp_quants(QK_K / 32, 63, mins, Lm, sw);
+#pragma unroll
+        for (int j = 0; j < QK_K / 32; ++j) {
+            const uint8_t ls = Ls[j] > 63 ? 63 : Ls[j];
+            const uint8_t lm = Lm[j] > 63 ? 63 : Lm[j];
+            if (j < 4) {
+                yb->scales[j] = ls;
+                yb->scales[j + 4] = lm;
+            } else {
+                yb->scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                yb->scales[j - 4] |= ((ls >> 4) << 6);
+                yb->scales[j - 0] |= ((lm >> 4) << 6);
+            }
+        }
+        yb->data.d = __float2half(d_block);
+        yb->data.dmin = __float2half(m_block);
+    }
+
+#pragma unroll
+    for (int j = 0; j < QK_K / 32; ++j) {
+        uint8_t sc;
+        uint8_t m;
+        classic_cuda_get_scale_min_k4(j, yb->scales, &sc, &m);
+        const float d = __half2float(yb->data.d) * sc;
+        if (d == 0.0f) {
+            continue;
+        }
+        const float dm = __half2float(yb->data.dmin) * m;
+#pragma unroll
+        for (int ii = 0; ii < 32; ++ii) {
+            int l = classic_cuda_nearest_int((xb[32 * j + ii] + dm) / d);
+            l = classic_cuda_clamp_int(l, 0, 31);
+            L[32 * j + ii] = (uint8_t) l;
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < QK_K / 8; ++i) {
+        yb->qh[i] = 0;
+    }
+    uint8_t * ql = yb->qs;
+    uint8_t m1 = 1;
+    uint8_t m2 = 2;
+#pragma unroll
+    for (int n = 0; n < QK_K; n += 64) {
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            int l1 = L[n + j];
+            if (l1 > 15) {
+                l1 -= 16;
+                yb->qh[j] |= m1;
+            }
+            int l2 = L[n + j + 32];
+            if (l2 > 15) {
+                l2 -= 16;
+                yb->qh[j] |= m2;
+            }
+            ql[j] = l1 | (l2 << 4);
+        }
+        m1 <<= 2;
+        m2 <<= 2;
+        ql += 32;
+    }
+}
+
+static __global__ void ggml_cuda_quantize_q6_K_blocks(
+        const float * x,
+        const float * qw,
+        block_q6_K * y,
+        int64_t row_blocks) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int64_t ib = (int64_t) blockIdx.x;
+    const int64_t block_in_row = ib % row_blocks;
+    const int64_t row = ib / row_blocks;
+    const float * xb = x + row * row_blocks * QK_K + block_in_row * QK_K;
+    const float * qwb = qw ? (qw + block_in_row * QK_K) : nullptr;
+    block_q6_K * yb = y + ib;
+
+    int8_t L[QK_K];
+    float scales[QK_K / 16];
+    float max_scale = 0.0f;
+    float max_abs_scale = 0.0f;
+
+#pragma unroll
+    for (int j = 0; j < QK_K / 16; ++j) {
+        scales[j] = qwb == nullptr
+            ? classic_cuda_make_qx_quants_16_32(xb + 16 * j, L + 16 * j)
+            : classic_cuda_make_qx_quants(16, 32, xb + 16 * j, L + 16 * j, 1, qwb + 16 * j);
+        const float abs_scale = fabsf(scales[j]);
+        if (abs_scale > max_abs_scale) {
+            max_abs_scale = abs_scale;
+            max_scale = scales[j];
+        }
+    }
+
+    if (max_abs_scale < 1e-15f) {
+#pragma unroll
+        for (int i = 0; i < QK_K / 2; ++i) {
+            yb->ql[i] = 0;
+        }
+#pragma unroll
+        for (int i = 0; i < QK_K / 4; ++i) {
+            yb->qh[i] = 0;
+        }
+#pragma unroll
+        for (int i = 0; i < QK_K / 16; ++i) {
+            yb->scales[i] = 0;
+        }
+        yb->d = __float2half(0.0f);
+        return;
+    }
+
+    const float iscale = -128.0f / max_scale;
+    yb->d = __float2half(1.0f / iscale);
+#pragma unroll
+    for (int j = 0; j < QK_K / 16; ++j) {
+        const int sc = classic_cuda_nearest_int(iscale * scales[j]);
+        yb->scales[j] = (int8_t) (sc < 127 ? sc : 127);
+    }
+
+#pragma unroll
+    for (int j = 0; j < QK_K / 16; ++j) {
+        const float d = __half2float(yb->d) * yb->scales[j];
+        if (d == 0.0f) {
+            continue;
+        }
+#pragma unroll
+        for (int ii = 0; ii < 16; ++ii) {
+            int l = classic_cuda_nearest_int(xb[16 * j + ii] / d);
+            l = classic_cuda_clamp_int(l, -32, 31);
+            L[16 * j + ii] = (int8_t) (l + 32);
+        }
+    }
+
+    uint8_t * ql = yb->ql;
+    uint8_t * qh = yb->qh;
+#pragma unroll
+    for (int j = 0; j < QK_K; j += 128) {
+#pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            const uint8_t q1 = L[j + l +  0] & 0xF;
+            const uint8_t q2 = L[j + l + 32] & 0xF;
+            const uint8_t q3 = L[j + l + 64] & 0xF;
+            const uint8_t q4 = L[j + l + 96] & 0xF;
+            ql[l +  0] = q1 | (q3 << 4);
+            ql[l + 32] = q2 | (q4 << 4);
+            qh[l] = (L[j + l] >> 4) | ((L[j + l + 32] >> 4) << 2) |
+                ((L[j + l + 64] >> 4) << 4) | ((L[j + l + 96] >> 4) << 6);
+        }
+        ql += 64;
+        qh += 32;
+    }
+}
+
 static __global__ void ggml_cuda_mxfp6_e2m3_eval_quantized(
         const void * x,
         bool x_bf16,
@@ -2156,6 +3524,47 @@ static void nvfp4_host_prepare_block_sample(
     }
 
     *sampled_ptr = sampled.data();
+}
+
+static bool nvfp4_cuda_copy_float_blocks_to_host(
+        const float * d_src,
+        int64_t nb_total,
+        std::vector<float> & host,
+        const float ** host_ptr,
+        const char * stage,
+        cudaStream_t stream) {
+    if (host_ptr == nullptr) {
+        return false;
+    }
+    *host_ptr = nullptr;
+    host.clear();
+    if (d_src == nullptr) {
+        return true;
+    }
+    if (nb_total <= 0) {
+        return false;
+    }
+
+    host.resize((size_t) nb_total * QK_NVFP4);
+    const size_t bytes = (size_t) nb_total * QK_NVFP4 * sizeof(float);
+    cudaStream_t st = stream ? stream : 0;
+    cudaError_t err = cudaMemcpyAsync(host.data(), d_src, bytes, cudaMemcpyDeviceToHost, st);
+    if (err != cudaSuccess) {
+        nvfp4_cuda_log_failure(stage, err);
+        cudaGetLastError();
+        host.clear();
+        return false;
+    }
+    err = cudaStreamSynchronize(st);
+    if (err != cudaSuccess) {
+        nvfp4_cuda_log_failure(stage, err);
+        cudaGetLastError();
+        host.clear();
+        return false;
+    }
+
+    *host_ptr = host.data();
+    return true;
 }
 
 static double nvfp4_host_robust_score(
@@ -2604,7 +4013,7 @@ static int nvfp4_cuda_autotune_worker_count(int64_t work_items) {
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
     int64_t configured = g_nvfp4_cuda_autotune_threads.load(std::memory_order_acquire);
     if (configured <= 0) {
-        configured = std::min<int64_t>(4, (int64_t) hw);
+        configured = 1;
         size_t free_bytes = 0;
         size_t total_bytes = 0;
         if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
@@ -2616,6 +4025,7 @@ static int nvfp4_cuda_autotune_worker_count(int64_t work_items) {
             }
         } else {
             cudaGetLastError();
+            configured = std::min<int64_t>(2, (int64_t) hw);
         }
     }
     configured = std::min<int64_t>(configured, 4);
@@ -3986,22 +5396,37 @@ extern "C" bool ggml_cuda_nvfp4_autotune_ex(
     std::vector<float> x_refine_sample;
     std::vector<float> qw_coarse_sample;
     std::vector<float> qw_refine_sample;
+    std::vector<float> x_device_host;
+    std::vector<float> qw_device_host;
     const float * x_coarse = nullptr;
     const float * x_refine = nullptr;
     const float * qw_coarse = nullptr;
     const float * qw_refine = nullptr;
+    bool have_device_samples = false;
     if (input_device && (qw == nullptr || qw_device)) {
         auto & tls = g_nvfp4_cuda_autotune_tls;
-        if (!nvfp4_cuda_prepare_device_block_sample(tls, x, qw, nb_total, coarse_nb, 0, false, &x_coarse, &qw_coarse, st) ||
-            !nvfp4_cuda_prepare_device_block_sample(tls, x, qw, nb_total, refine_nb, 0, true, &x_refine, &qw_refine, st)) {
+        have_device_samples =
+            nvfp4_cuda_prepare_device_block_sample(tls, x, qw, nb_total, coarse_nb, 0, false, &x_coarse, &qw_coarse, st) &&
+            nvfp4_cuda_prepare_device_block_sample(tls, x, qw, nb_total, refine_nb, 0, true, &x_refine, &qw_refine, st);
+    }
+    if (!have_device_samples) {
+        const float * x_host_src = x;
+        const float * qw_host_src = qw;
+        if (input_device &&
+                !nvfp4_cuda_copy_float_blocks_to_host(x, nb_total, x_device_host, &x_host_src,
+                    "autotune D2H(device x fallback)", st)) {
             return false;
         }
-    } else {
-        nvfp4_host_prepare_block_sample(x, nb_total, coarse_nb, x_coarse_sample, &x_coarse);
-        nvfp4_host_prepare_block_sample(x, nb_total, refine_nb, x_refine_sample, &x_refine);
+        if (qw_device &&
+                !nvfp4_cuda_copy_float_blocks_to_host(qw, nb_total, qw_device_host, &qw_host_src,
+                    "autotune D2H(device qw fallback)", st)) {
+            return false;
+        }
+        nvfp4_host_prepare_block_sample(x_host_src, nb_total, coarse_nb, x_coarse_sample, &x_coarse);
+        nvfp4_host_prepare_block_sample(x_host_src, nb_total, refine_nb, x_refine_sample, &x_refine);
         if (qw != nullptr) {
-            nvfp4_host_prepare_block_sample(qw, nb_total, coarse_nb, qw_coarse_sample, &qw_coarse);
-            nvfp4_host_prepare_block_sample(qw, nb_total, refine_nb, qw_refine_sample, &qw_refine);
+            nvfp4_host_prepare_block_sample(qw_host_src, nb_total, coarse_nb, qw_coarse_sample, &qw_coarse);
+            nvfp4_host_prepare_block_sample(qw_host_src, nb_total, refine_nb, qw_refine_sample, &qw_refine);
         }
     }
 
@@ -5180,6 +6605,116 @@ static bool ggml_cuda_nvfp4_tensor_active_data(ggml_tensor * tensor, void ** dat
     }
 
     return false;
+}
+
+static bool ggml_cuda_classic_quant_type_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+extern "C" bool ggml_cuda_quantize_classic_impl(
+        int32_t type_i,
+        const float * x,
+        void * vy,
+        int64_t nrow,
+        int64_t n_per_row,
+        const float * qw,
+        int32_t rsf_mode,
+        cudaStream_t stream) {
+    const ggml_type type = (ggml_type) type_i;
+    if (x == nullptr || vy == nullptr || nrow <= 0 || n_per_row <= 0 ||
+            (n_per_row % QK_K) != 0 ||
+            !ggml_cuda_classic_quant_type_supported(type)) {
+        return false;
+    }
+    if (rsf_mode != 0) {
+        return false;
+    }
+    if (type == GGML_TYPE_Q2_K || (type == GGML_TYPE_Q5_K && qw == nullptr)) {
+        return false;
+    }
+
+    const int64_t row_blocks = n_per_row / QK_K;
+    const int64_t nb_total = nrow * row_blocks;
+    const size_t bytes_x = (size_t) nrow * (size_t) n_per_row * sizeof(float);
+    const size_t bytes_qw = qw != nullptr ? (size_t) n_per_row * sizeof(float) : 0;
+    const size_t bytes_y = (size_t) nrow * ggml_row_size(type, n_per_row);
+
+    auto & tls = g_classic_cuda_quant_tls;
+    if (!ggml_cuda_nvfp4_ensure_buf((void **) &tls.d_x_buf, &tls.d_x_cap, bytes_x, "cudaMalloc(classic x)") ||
+            (bytes_qw != 0 && !ggml_cuda_nvfp4_ensure_buf((void **) &tls.d_qw_buf, &tls.d_qw_cap, bytes_qw, "cudaMalloc(classic qw)")) ||
+            !ggml_cuda_nvfp4_ensure_buf(&tls.d_y_buf, &tls.d_y_cap, bytes_y, "cudaMalloc(classic y)")) {
+        return false;
+    }
+
+    cudaStream_t st = stream ? stream : 0;
+    auto fail_quant_stream = [&](const char * label, cudaError_t status) {
+        nvfp4_cuda_log_failure(label, status);
+        (void) cudaStreamSynchronize(st);
+        cudaGetLastError();
+        tls.reset();
+        return false;
+    };
+
+    cudaError_t err = cudaMemcpyAsync(tls.d_x_buf, x, bytes_x, cudaMemcpyHostToDevice, st);
+    if (err != cudaSuccess) {
+        return fail_quant_stream("classic H2D(x)", err);
+    }
+    if (bytes_qw != 0) {
+        err = cudaMemcpyAsync(tls.d_qw_buf, qw, bytes_qw, cudaMemcpyHostToDevice, st);
+        if (err != cudaSuccess) {
+            return fail_quant_stream("classic H2D(qw)", err);
+        }
+    }
+
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+            ggml_cuda_quantize_q2_K_blocks<<<(unsigned) nb_total, 1, 0, st>>>(
+                    tls.d_x_buf, bytes_qw ? tls.d_qw_buf : nullptr, (block_q2_K *) tls.d_y_buf, row_blocks);
+            break;
+        case GGML_TYPE_Q3_K:
+            ggml_cuda_quantize_q3_K_blocks<<<(unsigned) nb_total, 1, 0, st>>>(
+                    tls.d_x_buf, bytes_qw ? tls.d_qw_buf : nullptr, (block_q3_K *) tls.d_y_buf, row_blocks);
+            break;
+        case GGML_TYPE_Q4_K:
+            ggml_cuda_quantize_q4_K_blocks<<<(unsigned) nb_total, 1, 0, st>>>(
+                    tls.d_x_buf, bytes_qw ? tls.d_qw_buf : nullptr, (block_q4_K *) tls.d_y_buf, row_blocks);
+            break;
+        case GGML_TYPE_Q5_K:
+            ggml_cuda_quantize_q5_K_blocks<<<(unsigned) nb_total, 1, 0, st>>>(
+                    tls.d_x_buf, bytes_qw ? tls.d_qw_buf : nullptr, (block_q5_K *) tls.d_y_buf, row_blocks);
+            break;
+        case GGML_TYPE_Q6_K:
+            ggml_cuda_quantize_q6_K_blocks<<<(unsigned) nb_total, 1, 0, st>>>(
+                    tls.d_x_buf, bytes_qw ? tls.d_qw_buf : nullptr, (block_q6_K *) tls.d_y_buf, row_blocks);
+            break;
+        default:
+            return false;
+    }
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        return fail_quant_stream("classic kernel", err);
+    }
+
+    err = cudaMemcpyAsync(vy, tls.d_y_buf, bytes_y, cudaMemcpyDeviceToHost, st);
+    if (err != cudaSuccess) {
+        return fail_quant_stream("classic D2H(y)", err);
+    }
+    err = cudaStreamSynchronize(st);
+    if (err != cudaSuccess) {
+        return fail_quant_stream("classic sync", err);
+    }
+
+    return true;
 }
 
 extern "C" bool ggml_cuda_tensor_set_host_impl(

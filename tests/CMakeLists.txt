@@ -27,6 +27,10 @@ endfunction()
 
 advanced_quantizer_test(test-quantize-fns.cpp)
 advanced_quantizer_test(test-quantize-perf.cpp)
+if (TARGET ggml-cuda)
+    advanced_quantizer_test(test-quantize-cuda-classic.cpp)
+    target_link_libraries(test-quantize-cuda-classic PRIVATE ggml-cuda)
+endif()
 
 # Build-only helper: requires a caller-supplied GGUF model path for useful runs.
 advanced_quantizer_build(test-quantize-stats.cpp)

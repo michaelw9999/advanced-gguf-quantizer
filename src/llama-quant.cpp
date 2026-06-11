@@ -304,6 +304,27 @@ static bool llama_nvfp4_trace_enabled() {
     return LLAMA_NVFP4_TRACE_ENABLED;
 }
 
+static bool llama_classic_quant_cuda_enabled() {
+    return true;
+}
+
+static bool llama_classic_quant_cuda_trace_enabled() {
+    return false;
+}
+
+static bool llama_classic_quant_cuda_supported_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static int64_t llama_nvfp4_encoder_sample_cap_override(const llama_model_quantize_params * params) {
     if (params == nullptr || params->nvfp4_encoder_max_blocks <= 0) {
         return LLAMA_NVFP4_ENCODER_MAX_BLOCKS_DEFAULT;
@@ -1849,6 +1870,109 @@ static size_t llama_tensor_quantize_impl(
             default:             return 0;
         }
     };
+
+#ifdef GGML_USE_CUDA
+    if (llama_classic_quant_cuda_enabled() &&
+            f32_data != nullptr &&
+            !use_qk_rsf_cpu &&
+            llama_classic_quant_cuda_supported_type(new_type)) {
+        const auto cuda_begin = std::chrono::steady_clock::now();
+        const bool trace = llama_classic_quant_cuda_trace_enabled();
+        const int64_t cpu_chunk_rows = std::max<int64_t>(1, chunk_size / n_per_row);
+        const int desired_cuda_threads = std::max(1, (int) std::min<int64_t>(nrows, std::min<int>(nthread, 16)));
+        const int64_t cuda_chunk_rows = llama_nvfp4_cuda_chunk_rows(nrows, n_per_row, false, cpu_chunk_rows, desired_cuda_threads);
+        const int64_t cuda_nchunk = (nrows + cuda_chunk_rows - 1) / cuda_chunk_rows;
+        const int cuda_threads = llama_nvfp4_cuda_parallel_threads(nthread, cuda_nchunk);
+        bool cuda_ok = false;
+
+        auto quantize_cuda_once = [&](const float * src_chunk, void * dst_chunk, int64_t chunk_rows, void * stream_key) {
+            return ggml_cuda_quantize_classic((int32_t) new_type, src_chunk, dst_chunk, chunk_rows, n_per_row, imatrix, 0, stream_key);
+        };
+
+        if (cuda_threads > 1 && cuda_nchunk > 1) {
+            std::atomic<int64_t> next_row{0};
+            std::atomic<bool> chunks_ok{true};
+
+            auto cuda_worker = [&](int worker_idx) {
+                void * stream_key = reinterpret_cast<void *>((uintptr_t) (0x3000 + worker_idx));
+                while (chunks_ok.load(std::memory_order_relaxed)) {
+                    const int64_t first_row = next_row.fetch_add(cuda_chunk_rows, std::memory_order_relaxed);
+                    if (first_row >= nrows) {
+                        break;
+                    }
+
+                    const int64_t this_nrow = std::min(nrows - first_row, cuda_chunk_rows);
+                    const float * src_chunk = f32_data + first_row * n_per_row;
+                    void * dst_chunk = (char *) new_data + first_row * row_size;
+                    if (!quantize_cuda_once(src_chunk, dst_chunk, this_nrow, stream_key)) {
+                        chunks_ok.store(false, std::memory_order_relaxed);
+                        break;
+                    }
+
+                    const size_t chunk_bytes = (size_t) this_nrow * row_size;
+                    if (!ggml_validate_row_data(new_type, dst_chunk, chunk_bytes)) {
+                        LLAMA_LOG_WARN("%s: classic cuda validation failed tensor=%s type=%s first_row=%" PRId64 " rows=%" PRId64 " bytes=%zu\n",
+                                __func__,
+                                tensor_name ? tensor_name : "(unknown)",
+                                ggml_type_name(new_type),
+                                first_row,
+                                this_nrow,
+                                chunk_bytes);
+                        chunks_ok.store(false, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+            };
+
+            workers.clear();
+            workers.reserve((size_t) cuda_threads - 1);
+            for (int t = 1; t < cuda_threads; ++t) {
+                workers.emplace_back(cuda_worker, t);
+            }
+            cuda_worker(0);
+            for (auto & w : workers) {
+                w.join();
+            }
+            workers.clear();
+            cuda_ok = chunks_ok.load(std::memory_order_relaxed);
+        } else {
+            cuda_ok = quantize_cuda_once(f32_data, new_data, nrows, reinterpret_cast<void *>(4));
+            if (cuda_ok) {
+                const size_t bytes = (size_t) nrows * row_size;
+                cuda_ok = ggml_validate_row_data(new_type, new_data, bytes);
+            }
+        }
+
+        const double total_cuda_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cuda_begin).count();
+        if (cuda_ok) {
+            const size_t new_size = (size_t) nrows * row_size;
+            if (trace) {
+                LLAMA_LOG_INFO("%s: classic cuda ok tensor=%s type=%s rows=%" PRId64 " cols=%" PRId64 " total=%.2f ms cuda_threads=%d cuda_chunk_rows=%" PRId64 "\n",
+                        __func__,
+                        tensor_name ? tensor_name : "(unknown)",
+                        ggml_type_name(new_type),
+                        nrows,
+                        n_per_row,
+                        total_cuda_ms,
+                        cuda_threads,
+                        cuda_chunk_rows);
+            }
+            return new_size;
+        }
+
+        if (trace) {
+            LLAMA_LOG_WARN("%s: classic cuda fallback tensor=%s type=%s rows=%" PRId64 " cols=%" PRId64 " total=%.2f ms cuda_threads=%d cuda_chunk_rows=%" PRId64 "\n",
+                    __func__,
+                    tensor_name ? tensor_name : "(unknown)",
+                    ggml_type_name(new_type),
+                    nrows,
+                    n_per_row,
+                    total_cuda_ms,
+                    cuda_threads,
+                    cuda_chunk_rows);
+        }
+    }
+#endif
 
     if (nthread < 2 || new_type == GGML_TYPE_MXFP6_E2M3) {
         size_t new_size = 0;
