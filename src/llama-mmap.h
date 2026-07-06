@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama.h"
+
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -16,7 +18,7 @@ using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 struct llama_file {
     llama_file(const char * fname, const char * mode, bool use_direct_io = false);
     llama_file(FILE * file);
-    ~llama_file();
+    LLAMA_API ~llama_file();
 
     size_t tell() const;
     size_t size() const;
@@ -43,7 +45,7 @@ private:
 struct llama_mmap {
     llama_mmap(const llama_mmap &) = delete;
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false);
-    ~llama_mmap();
+    LLAMA_API ~llama_mmap();
 
     size_t size() const;
     void * addr() const;

@@ -144,14 +144,14 @@ typedef struct nvfp4_cuda_kld_result {
     int64_t count;
 } nvfp4_cuda_kld_result;
 
-GGML_BACKEND_API bool nvfp4_autotune(const float * x, const float * qw, int64_t n, float * best_a, float * best_b);
-GGML_BACKEND_API bool nvfp4_autotune_cuda(const float * x, const float * qw, int64_t n, float * best_a, float * best_b, void * stream);
-GGML_BACKEND_API bool nvfp4_autotune_cuda_cfg(
+GGML_API bool nvfp4_autotune(const float * x, const float * qw, int64_t n, float * best_a, float * best_b);
+GGML_API bool nvfp4_autotune_cuda(const float * x, const float * qw, int64_t n, float * best_a, float * best_b, void * stream);
+GGML_API bool nvfp4_autotune_cuda_cfg(
         const float * x, const float * qw, int64_t n,
         const nvfp4_cuda_runtime_cfg * cfg_hint,
         nvfp4_cuda_tune_result * result,
         void * stream);
-GGML_BACKEND_API bool nvfp4_sample_cache_cuda_create(
+GGML_API bool nvfp4_sample_cache_cuda_create(
         const void * x, int32_t x_type,
         int64_t nrow, int64_t n_per_row,
         const float * qw,
@@ -163,30 +163,30 @@ GGML_BACKEND_API bool nvfp4_sample_cache_cuda_create(
         const float ** qw_device,
         int64_t * n_device,
         void * stream);
-GGML_BACKEND_API void nvfp4_sample_cache_cuda_free(void * cache);
-GGML_BACKEND_API void nvfp4_set_ab(float a, float b);
-GGML_BACKEND_API void nvfp4_clear_ab(void);
-GGML_BACKEND_API void nvfp4_set_runtime_cfg(const nvfp4_cuda_runtime_cfg * cfg);
-GGML_BACKEND_API bool nvfp4_get_runtime_cfg(nvfp4_cuda_runtime_cfg * cfg, const nvfp4_cuda_runtime_cfg * cfg_hint);
-GGML_BACKEND_API void nvfp4_clear_runtime_cfg(void);
-GGML_BACKEND_API void nvfp4_set_autotune_threads(int32_t n_threads);
-GGML_BACKEND_API void nvfp4_clear_cuda_stream_cache(void);
+GGML_API void nvfp4_sample_cache_cuda_free(void * cache);
+GGML_API void nvfp4_set_ab(float a, float b);
+GGML_API void nvfp4_clear_ab(void);
+GGML_API void nvfp4_set_runtime_cfg(const nvfp4_cuda_runtime_cfg * cfg);
+GGML_API bool nvfp4_get_runtime_cfg(nvfp4_cuda_runtime_cfg * cfg, const nvfp4_cuda_runtime_cfg * cfg_hint);
+GGML_API void nvfp4_clear_runtime_cfg(void);
+GGML_API void nvfp4_set_autotune_threads(int32_t n_threads);
+GGML_API void nvfp4_clear_cuda_stream_cache(void);
 
-GGML_BACKEND_API bool nvfp4_quantize_cuda(const void * x, bool x_bf16, void * vy, int64_t nrow, int64_t n_per_row, const float * qw, float x_scale, void * stream);
-GGML_BACKEND_API bool nvfp4_quantize_cuda_ab(const void * x, bool x_bf16, void * vy, int64_t nrow, int64_t n_per_row, const float * qw, float x_scale, float a, float b, void * stream);
-GGML_BACKEND_API bool nvfp4_quantize_cuda_ab_cfg(
+GGML_API bool nvfp4_quantize_cuda(const void * x, bool x_bf16, void * vy, int64_t nrow, int64_t n_per_row, const float * qw, float x_scale, void * stream);
+GGML_API bool nvfp4_quantize_cuda_ab(const void * x, bool x_bf16, void * vy, int64_t nrow, int64_t n_per_row, const float * qw, float x_scale, float a, float b, void * stream);
+GGML_API bool nvfp4_quantize_cuda_ab_cfg(
         const void * x, bool x_bf16, void * vy,
         int64_t nrow, int64_t n_per_row, const float * qw,
         float x_scale, float a, float b,
         const nvfp4_cuda_runtime_cfg * cfg, void * stream);
-GGML_BACKEND_API bool nvfp4_quantize_cuda_ab_eval_cfg(
+GGML_API bool nvfp4_quantize_cuda_ab_eval_cfg(
         const void * x, bool x_bf16, void * vy,
         int64_t nrow, int64_t n_per_row, const float * qw,
         float x_scale, float a, float b,
         const nvfp4_cuda_runtime_cfg * cfg,
         nvfp4_cuda_eval_result * eval,
         void * stream);
-GGML_BACKEND_API bool nvfp4_quantize_cuda_ab_eval_to_tensor_cfg(
+GGML_API bool nvfp4_quantize_cuda_ab_eval_to_tensor_cfg(
         const void * x, bool x_bf16, struct ggml_tensor * tensor,
         int64_t plane_index,
         int64_t nrow, int64_t n_per_row, const float * qw,
@@ -194,25 +194,25 @@ GGML_BACKEND_API bool nvfp4_quantize_cuda_ab_eval_to_tensor_cfg(
         const nvfp4_cuda_runtime_cfg * cfg,
         nvfp4_cuda_eval_result * eval,
         void * stream);
-GGML_BACKEND_API bool nvfp4_quantize_cuda_cfg(
+GGML_API bool nvfp4_quantize_cuda_cfg(
         const void * x, bool x_bf16, void * vy,
         int64_t nrow, int64_t n_per_row, const float * qw,
         float x_scale, const nvfp4_cuda_runtime_cfg * cfg, void * stream);
-GGML_BACKEND_API bool mxfp6_e2m3_quantize_cuda(
+GGML_API bool mxfp6_e2m3_quantize_cuda(
         const void * x, bool x_bf16, void * vy,
         int64_t nrow, int64_t n_per_row, const float * qw,
         float x_scale, void * stream);
-GGML_BACKEND_API bool mxfp6_e2m3_quantize_cuda_eval(
+GGML_API bool mxfp6_e2m3_quantize_cuda_eval(
         const void * x, bool x_bf16, void * vy,
         int64_t nrow, int64_t n_per_row, const float * qw,
         float x_scale, nvfp4_cuda_eval_result * eval, void * stream);
-GGML_BACKEND_API bool mxfp6_e2m3_quantize_cuda_eval_to_tensor(
+GGML_API bool mxfp6_e2m3_quantize_cuda_eval_to_tensor(
         const void * x, bool x_bf16, struct ggml_tensor * tensor,
         int64_t plane_index,
         int64_t nrow, int64_t n_per_row, const float * qw,
         float x_scale, float header_weight_scale, float header_input_scale,
         nvfp4_cuda_eval_result * eval, void * stream);
-GGML_BACKEND_API bool ggml_cuda_quantize_classic(
+GGML_API bool ggml_cuda_quantize_classic(
         int32_t type,
         const float * x,
         void * vy,
@@ -221,18 +221,18 @@ GGML_BACKEND_API bool ggml_cuda_quantize_classic(
         const float * qw,
         int32_t rsf_mode,
         void * stream);
-GGML_BACKEND_API bool ggml_cuda_tensor_set_host(
+GGML_API bool ggml_cuda_tensor_set_host(
         struct ggml_tensor * tensor, const void * src, size_t nbytes, void * stream);
-GGML_BACKEND_API bool ggml_cuda_nvfp4_tensor_set_header_scales(
+GGML_API bool ggml_cuda_nvfp4_tensor_set_header_scales(
         struct ggml_tensor * tensor, float weight_scale, float input_scale, void * stream);
-GGML_BACKEND_API bool ggml_cuda_tensor_get_host(
+GGML_API bool ggml_cuda_tensor_get_host(
         const struct ggml_tensor * tensor, void * dst, size_t nbytes, void * stream);
-GGML_BACKEND_API bool ggml_cuda_tensor_snapshot(
+GGML_API bool ggml_cuda_tensor_snapshot(
         const struct ggml_tensor * tensor, size_t nbytes, void ** snapshot, void * stream);
-GGML_BACKEND_API bool ggml_cuda_tensor_restore(
+GGML_API bool ggml_cuda_tensor_restore(
         struct ggml_tensor * tensor, const void * snapshot, size_t nbytes, void * stream);
-GGML_BACKEND_API void ggml_cuda_tensor_snapshot_free(void * snapshot);
-GGML_BACKEND_API bool nvfp4_kld_reduce_cuda_tensor(
+GGML_API void ggml_cuda_tensor_snapshot_free(void * snapshot);
+GGML_API bool nvfp4_kld_reduce_cuda_tensor(
         const struct ggml_tensor * logits,
         const uint16_t * base_logp_u16,
         const int32_t * token_ids,

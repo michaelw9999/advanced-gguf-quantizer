@@ -6536,6 +6536,23 @@ static bool selector_choose_policy(
         }
     }
 
+    auto clear_selector_cuda_caches = [&](bool clear_device_samples) {
+        if (clear_device_samples) {
+            for (auto & b : all_bindings) {
+                if (b.device_samples) {
+                    std::lock_guard<std::mutex> lock(b.device_samples->mutex);
+                    b.device_samples->entries.clear();
+                }
+            }
+        }
+        nvfp4_clear_cuda_stream_cache();
+    };
+    const bool keep_device_sample_cache =
+        selector_control_i64("KEEP_DEVICE_SAMPLE_CACHE", 0) != 0;
+    auto finish_selector_cuda_policy_scope = [&]() {
+        clear_selector_cuda_caches(!keep_device_sample_cache);
+    };
+
     selector_restore_counters runtime_restore_counters;
     auto restore_all = [&]() {
         if (!want_measured_eval) {
@@ -7312,7 +7329,9 @@ static bool selector_choose_policy(
             policies.size(),
             policy.name.c_str(),
             stress_binding_indices.size());
-        if (!score_proxy_policy(policy, stress_binding_indices)) {
+        const bool score_ok = score_proxy_policy(policy, stress_binding_indices);
+        finish_selector_cuda_policy_scope();
+        if (!score_ok) {
             reject_policy(policy, "stage-a");
             continue;
         }
@@ -7339,7 +7358,9 @@ static bool selector_choose_policy(
                 refined.size(),
                 policy.name.c_str(),
                 stress_binding_indices.size());
-            if (!score_proxy_policy(policy, stress_binding_indices)) {
+            const bool score_ok = score_proxy_policy(policy, stress_binding_indices);
+            finish_selector_cuda_policy_scope();
+            if (!score_ok) {
                 reject_policy(policy, "refine");
                 continue;
             }
@@ -7544,7 +7565,10 @@ static bool selector_choose_policy(
                 policies[policy_idx].name.c_str(),
                 all_binding_indices.size(),
                 survey_sample_blocks);
-            if (!score_proxy_policy_extended(policies[policy_idx], all_binding_indices, survey_sample_blocks, true, "stage-a-survey")) {
+            const bool score_ok = score_proxy_policy_extended(
+                policies[policy_idx], all_binding_indices, survey_sample_blocks, true, "stage-a-survey");
+            finish_selector_cuda_policy_scope();
+            if (!score_ok) {
                 reject_policy(policies[policy_idx], "survey");
                 continue;
             }
@@ -8410,6 +8434,7 @@ static bool selector_choose_policy(
                         policy.name.c_str(),
                         policy_holdout_summary.c_str());
                 }
+                finish_selector_cuda_policy_scope();
                 finish_stageb_policy_unit("selector-stage-b-policy-cached", true, false);
                 if (note_skip_remaining("stage-b")) {
                     break;
@@ -8473,13 +8498,7 @@ static bool selector_choose_policy(
             }
             const size_t no_failed_patch = std::numeric_limits<size_t>::max();
             auto clear_stageb_retry_caches = [&]() {
-                nvfp4_clear_cuda_stream_cache();
-                for (auto & b : all_bindings) {
-                    if (b.device_samples) {
-                        std::lock_guard<std::mutex> lock(b.device_samples->mutex);
-                        b.device_samples->entries.clear();
-                    }
-                }
+                clear_selector_cuda_caches(true);
             };
             auto patch_policy_once = [&](int attempt, size_t & failed_pos) -> bool {
                 failed_pos = no_failed_patch;
@@ -8798,6 +8817,7 @@ static bool selector_choose_policy(
                 policy.proxy_rejected = true;
                 policy.measured_pass = false;
                 policy.measured_score = std::numeric_limits<double>::infinity();
+                finish_selector_cuda_policy_scope();
                 finish_stageb_policy_unit("selector-stage-b-policy-rejected", true);
                 continue;
             }
@@ -8861,6 +8881,7 @@ static bool selector_choose_policy(
                 policy.has_holdout ? &policy.measured_holdout : nullptr,
                 policy.measured_pass,
                 policy.measured_score);
+            finish_selector_cuda_policy_scope();
             finish_stageb_policy_unit("selector-stage-b-policy-complete", true);
             if (note_skip_remaining("stage-b")) {
                 break;

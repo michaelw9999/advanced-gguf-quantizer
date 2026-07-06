@@ -408,7 +408,7 @@ void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 
     for (int ib = 0; ib < nb; ++ib) {
         for (int s_idx = 0; s_idx < 4; ++s_idx) {
-            const float d = ggml_ue4m3_to_fp32(x[ib].d[s_idx]);
+            const float d = GGML_CPU_UE4M3_TO_FP32(x[ib].d[s_idx]);
             const int q8_block = s_idx / 2;
             const int q8_off   = (s_idx % 2) * QK_NVFP4_SUB;
             const float dy = GGML_CPU_FP16_TO_FP32(y[2*ib + q8_block].d);
