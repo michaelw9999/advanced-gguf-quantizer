@@ -503,7 +503,8 @@ static __device__ __forceinline__ void load_mxfp8_tileA_1col_mmvq(
     ax[2] = int(q_lo[word + 4]);
     ax[3] = int(q_hi[word + 4]);
 
-    scaleA = (lane & 1 ? block_hi : block_lo).e[frag_idx];
+    const uint64_t e8 = *reinterpret_cast<const uint64_t *>((lane & 1 ? block_hi : block_lo).e);
+    scaleA = (e8 >> (8 * frag_idx)) & 0xFFu;
 }
 
 static __device__ __forceinline__ void load_mxfp8_tileB_1col_mmvq(
@@ -521,7 +522,8 @@ static __device__ __forceinline__ void load_mxfp8_tileB_1col_mmvq(
         bx[0] = int(q[lane]);
         bx[1] = int(q[lane + 4]);
         if (lane == 0) {
-            scale = block.d4[frag_idx];
+            const uint32_t d4 = *reinterpret_cast<const uint32_t *>(block.d4);
+            scale = (d4 >> (8 * frag_idx)) & 0xFFu;
         }
     } else {
         bx[0] = 0;
