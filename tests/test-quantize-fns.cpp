@@ -10,6 +10,9 @@
 #include <string>
 #include <vector>
 
+static_assert(GGML_TYPE_Q2_0 == 42, "Q2_0 must keep its upstream GGUF type ID");
+static_assert(GGML_TYPE_MXFP6_E2M3 == 50, "MXFP6 must use its reserved public type ID");
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -150,6 +153,7 @@ int main(int argc, char * argv[]) {
                 type == GGML_TYPE_Q1_0    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
@@ -175,7 +179,7 @@ int main(int argc, char * argv[]) {
                                           ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                                           : type == GGML_TYPE_Q1_0
                                           ? MAX_DOT_PRODUCT_ERROR_BINARY
-                                          : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0
+                                          : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0
                                           ? MAX_DOT_PRODUCT_ERROR_TERNARY
                                           : type == GGML_TYPE_NVFP4
                                           ? MAX_DOT_PRODUCT_ERROR_FP4
