@@ -115,6 +115,9 @@ typedef sycl::half2 ggml_half2;
 #define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
 #define QR_MXFP4 2
 
+#define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
+#define QR_MXFP8 1
+
 #define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
 #define QR_NVFP4 2
 
@@ -223,6 +226,14 @@ typedef struct {
     uint8_t qs[QK_MXFP4/2];
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
+#define QK_MXFP8 256
+#define QK_MXFP8_SUB 32
+typedef struct {
+    uint8_t qs[QK_MXFP8 / QK_MXFP8_SUB][QK_MXFP8_SUB];
+    uint8_t e[QK_MXFP8 / QK_MXFP8_SUB];
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == sizeof(uint8_t)*(QK_MXFP8/QK_MXFP8_SUB) + QK_MXFP8, "wrong mxfp8 block size/padding");
 
 #define QK_MXFP6 64
 #define QK_MXFP6_SUB 32
@@ -1172,6 +1183,27 @@ GGML_TABLE_END()
 GGML_TABLE_BEGIN(int8_t, kvalues_mxfp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
+
+#if defined(GGML_COMMON_IMPL_C)
+GGML_TABLE_BEGIN(int32_t, kvalues_mxfp8, 128)
+    0, 1, 2, 3, 4, 5, 6, 7,
+    8, 9, 10, 11, 12, 13, 14, 15,
+    16, 18, 20, 22, 24, 26, 28, 30,
+    32, 36, 40, 44, 48, 52, 56, 60,
+    64, 72, 80, 88, 96, 104, 112, 120,
+    128, 144, 160, 176, 192, 208, 224, 240,
+    256, 288, 320, 352, 384, 416, 448, 480,
+    512, 576, 640, 704, 768, 832, 896, 960,
+    1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920,
+    2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840,
+    4096, 4608, 5120, 5632, 6144, 6656, 7168, 7680,
+    8192, 9216, 10240, 11264, 12288, 13312, 14336, 15360,
+    16384, 18432, 20480, 22528, 24576, 26624, 28672, 30720,
+    32768, 36864, 40960, 45056, 49152, 53248, 57344, 61440,
+    65536, 73728, 81920, 90112, 98304, 106496, 114688, 122880,
+    131072, 147456, 163840, 180224, 196608, 212992, 229376, 0,
+GGML_TABLE_END()
+#endif
 
 // e2m3 values multiplied by 8.
 GGML_TABLE_BEGIN(int8_t, kvalues_mxfp6_e2m3, 64)

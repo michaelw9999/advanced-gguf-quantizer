@@ -442,6 +442,56 @@ static __global__ void quantize_mmq_fp8_e4m3(const float * __restrict__ x,
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
+static __global__ void quantize_mmq_mxfp8(
+        const float * __restrict__ x, const int32_t * __restrict__ ids,
+        void * __restrict__ vy, const int64_t ne00,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const int64_t i0 = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * 4;
+    if (i0 >= ne0) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const int64_t i1 = blockIdx.x;
+    const int64_t i2 = blockIdx.z % ne2;
+    const int64_t i3 = blockIdx.z / ne2;
+    const int64_t i01 = ids ? ids[i1] : i1;
+    const int64_t base_idx = i3 * s03 + i2 * s02 + i01 * s01;
+
+    const float4 xi = i0 < ne00 ?
+        make_float4(x[base_idx + i0 + 0], x[base_idx + i0 + 1],
+                    x[base_idx + i0 + 2], x[base_idx + i0 + 3]) :
+        make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    float amax = fmaxf(fabsf(xi.x), fabsf(xi.y));
+    amax = fmaxf(amax, fmaxf(fabsf(xi.z), fabsf(xi.w)));
+    amax = warp_reduce_max<QK_MXFP8_SUB / 4>(amax);
+
+    const uint8_t e = fp8_scale_code_from_amax(amax);
+    const float scale = ggml_cuda_e8m0_to_fp32(e);
+    const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    const uint32_t packed =
+        ((uint32_t) fp8_quant_e4m3(xi.x, inv_scale) <<  0) |
+        ((uint32_t) fp8_quant_e4m3(xi.y, inv_scale) <<  8) |
+        ((uint32_t) fp8_quant_e4m3(xi.z, inv_scale) << 16) |
+        ((uint32_t) fp8_quant_e4m3(xi.w, inv_scale) << 24);
+
+    block_mxfp8_mmq * y = (block_mxfp8_mmq *) vy;
+    const int64_t ib0 = blockIdx.z * ((int64_t) ne1 * ne0 / (4 * QK8_1));
+    const int64_t ib = ib0 + (i0 / (4 * QK8_1)) * ne1 + i1;
+    const int64_t iqs = i0 % (4 * QK8_1);
+    ((uint32_t *) y[ib].qs)[iqs / 4] = packed;
+    if (iqs % QK_MXFP8_SUB == 0) {
+        y[ib].d4[iqs / QK_MXFP8_SUB] = e;
+    }
+#else
+    GGML_UNUSED_VARS(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+    NO_DEVICE_CODE;
+#endif
+}
+
 template <bool has_ids, bool has_scale>
 static __global__ void quantize_row_fp8_e4m3(const float * __restrict__ x,
                                                const int32_t * __restrict__ ids,
@@ -767,6 +817,23 @@ void quantize_mmq_q8_1_cuda(
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+void quantize_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP8);
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % (4 * QK8_1) == 0);
+
+    const int64_t block_num_y =
+        (ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, ne2 * ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_mxfp8<<<num_blocks, block_size, 0, stream>>>(
+        x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
 }
 
 void quantize_mmq_nvfp4_cuda(

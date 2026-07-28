@@ -350,6 +350,31 @@ static inline int best_index_mxfp4(float x, float e) {
     return best_index;
 }
 
+static inline uint8_t best_index_mxfp8(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+
+    const uint8_t sign = (uint8_t) (bits >> 24) & 0x80;
+    bits &= 0x7FFFFFFF;
+
+    if (bits == 0) {
+        return sign;
+    }
+    if (bits >= 0x43E00000) {
+        return sign | 0x7E;
+    }
+    if (bits < 0x3C800000) {
+        const float v = fabsf(x) * 512.0f;
+        int q = (int) v;
+        const float r = v - q;
+        q += r > 0.5f || (r == 0.5f && (q & 1));
+        return sign | (uint8_t) q;
+    }
+
+    bits += 0x0007FFFF + ((bits >> 20) & 1);
+    return sign | (uint8_t) ((bits >> 20) - (120 << 3));
+}
+
 void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
@@ -383,6 +408,39 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
         }
     }
 }
+
+void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+    static const int qk_sub = QK_MXFP8_SUB;
+    static const int n_sub = QK_MXFP8 / QK_MXFP8_SUB;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < n_sub; s++) {
+            const float * xb = x + i*qk + s*qk_sub;
+            float amax = 0.0f;
+
+            for (int j = 0; j < qk_sub; j++) {
+                amax = MAX(amax, fabsf(xb[j]));
+            }
+
+            const float scale = amax / 448.0f;
+            int exponent;
+            const float mantissa = frexpf(scale, &exponent);
+            const int e = amax > 0.0f ? MAX(0, MIN(254, exponent + 126 + (mantissa > 0.5f))) : 127;
+            const float id = 1.0f / GGML_E8M0_TO_FP32(e);
+            y[i].e[s] = e;
+
+            for (int j = 0; j < qk_sub; j++) {
+                y[i].qs[s][j] = best_index_mxfp8(xb[j] * id);
+            }
+        }
+    }
+}
+
 static void quantize_mxfp6_k32_ref(const float * GGML_RESTRICT x, tile_mxfp6_frag * GGML_RESTRICT tile, int row, uint8_t * GGML_RESTRICT block) {
     float amax = 0.0f;
     for (int i = 0; i < QK_MXFP6_SUB; ++i) {
@@ -695,6 +753,29 @@ void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_REST
 
             y[i*qk + j + 0   ] = x0*d;
             y[i*qk + j + qk/2] = x1*d;
+        }
+    }
+}
+
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+    static const int qk_sub = QK_MXFP8_SUB;
+    static const int n_sub = QK_MXFP8 / QK_MXFP8_SUB;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < n_sub; s++) {
+            const float d = GGML_E8M0_TO_FP32(x[i].e[s]) * (1.0f / 512.0f);
+            float * yb = y + i*qk + s*qk_sub;
+
+            for (int j = 0; j < qk_sub; j++) {
+                const uint8_t q = x[i].qs[s][j];
+                const float v = d * kvalues_mxfp8[q & 0x7F];
+                yb[j] = q & 0x80 ? -v : v;
+            }
         }
     }
 }
@@ -3966,6 +4047,12 @@ size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
 }
 
+size_t quantize_mxfp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_mxfp8_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
+}
+
 size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     GGML_UNUSED(quant_weights);
     quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
@@ -7057,6 +7144,16 @@ static bool validate_e_e8m0(uint8_t e, size_t i) {
         } \
     }
 
+#define VALIDATE_ROW_DATA_EVEC_E8M0_IMPL(type, data, nb, nr) \
+    const type * q = (const type *) (data); \
+    for (size_t i = 0; i < (nb); ++i) { \
+        for (size_t j = 0; j < (nr); ++j) { \
+            if (!validate_e_e8m0(q[i].e[j], i)) { \
+                return false; \
+            } \
+        } \
+    }
+
 #define VALIDATE_ROW_DATA_DVEC_F16_IMPL(type, data, nb, nr) \
     const type * q = (const type *) (data); \
     for (size_t i = 0; i < (nb); ++i) { \
@@ -7227,6 +7324,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_MXFP4:
             {
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp4, data, nb);
+            } break;
+        case GGML_TYPE_MXFP8:
+            {
+                VALIDATE_ROW_DATA_EVEC_E8M0_IMPL(block_mxfp8, data, nb, QK_MXFP8 / QK_MXFP8_SUB);
             } break;
         case GGML_TYPE_MXFP6_E2M3:
             {

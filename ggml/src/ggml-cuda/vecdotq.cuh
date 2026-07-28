@@ -325,6 +325,33 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     return d * sumi;
 }
 
+#define VDR_MXFP8_Q8_1_MMVQ 4
+#define VDR_MXFP8_Q8_1_MMQ  8
+
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_1(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx, const int & iqs) {
+    const block_mxfp8 * bq8x = (const block_mxfp8 *) vbq + kbx;
+    const int frag = iqs >> 3;
+    const int word = iqs & 7;
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP8_Q8_1_MMVQ; ++l) {
+        const uint32_t x4 = get_int_b4(bq8x->qs[frag], word + l);
+        const uint32_t y4 = get_int_b4(bq8_1[frag].qs, word + l);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint8_t xcode = x4 >> (8 * i);
+            const int8_t yq = y4 >> (8 * i);
+            sumi += ggml_cuda_e4m3_to_i32_x512(xcode) * yq;
+        }
+    }
+
+    const float d = ggml_cuda_e8m0_to_fp32(bq8x->e[frag]) *
+        __low2float(bq8_1[frag].ds) * (1.0f / 512.0f);
+    return d * sumi;
+}
+
 static __device__ __forceinline__ int mxfp6_e2m3_pack4_i8x8(const uint32_t packed4) {
     const uint32_t c0 = (packed4 >>  0) & 0x3f;
     const uint32_t c1 = (packed4 >>  8) & 0x3f;

@@ -29,6 +29,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_MXFP4:
             mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_q_case<GGML_TYPE_MXFP8>(ctx, args, stream);
+            break;
         case GGML_TYPE_MXFP6_E2M3:
             mul_mat_q_case<GGML_TYPE_MXFP6_E2M3>(ctx, args, stream);
             break;
@@ -169,6 +172,7 @@ void ggml_cuda_mul_mat_q(
                               || GGML_CUDA_CC_IS_CDNA(cc);
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
+    const bool use_native_mxfp8 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP8;
     const bool use_native_mxfp6 = blackwell_mma_available(cc) &&
         ggml_is_contiguous(src0) && src0->view_src == nullptr &&
         src0->type == GGML_TYPE_MXFP6_E2M3 &&
@@ -216,6 +220,10 @@ void ggml_cuda_mul_mat_q(
 	                static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
 	                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
 	                                      ne11, ne12, ne13, stream);
+	            } else if (use_native_mxfp8) {
+	                static_assert(sizeof(block_mxfp8_mmq) == 4 * sizeof(block_q8_1));
+	                quantize_mmq_mxfp8_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+	                                        ne10_padded, ne11, ne12, ne13, stream);
 	            } else if (use_fp8_acts) {
 		            quantize_mmq_fp8_cuda(src1_d, nullptr, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
 		                                  ne10_padded, ne11, ne12, ne13, nullptr, 0, stream);
@@ -307,6 +315,9 @@ void ggml_cuda_mul_mat_q(
 	        if (use_native_mxfp4) {
 	            quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
 	                                  ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+	        } else if (use_native_mxfp8) {
+	            quantize_mmq_mxfp8_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+	                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
 	        } else if (use_fp8_acts) {
 	            quantize_mmq_fp8_cuda(src1_d, ids_src1.get(), ids_expert.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
 	                                  ne10_padded, ne11_flat, ne12_flat, ne13_flat, nullptr, 0, stream);
@@ -408,6 +419,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+
+    if (type == GGML_TYPE_MXFP8) {
+        return blackwell_mma_available(cc);
+    }
 
     bool mmq_supported;
 

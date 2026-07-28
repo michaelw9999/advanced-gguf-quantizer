@@ -65,6 +65,10 @@ struct block_fp4_mmq {
     uint32_t d4[4];       // 8 E8M0 scales (1 per 32 values), 2 packed per uint32: d4[0]={s0,s1}, d4[1]={s2,s3}, etc.
     int8_t   qs[4 * 32];  // 256 FP4 values packed as 4-bit pairs (2 per byte)
 };
+struct block_mxfp8_mmq {
+    uint32_t d4[4];                // 4 E8M0 scales per 128 activation values
+    uint8_t  qs[4 * QK8_1];       // 128 E4M3 values
+};
 struct block_nvfp4_mmq {
     uint32_t sc4_u32[4];  // 16 UE4M3 scales, one per 16-value subblock.
     uint32_t qs_u32[32];  // 256 E2M1 values packed as 4-bit pairs.
@@ -78,6 +82,7 @@ struct tile_mxfp6_e2m3_mmq {
 static_assert(sizeof(block_q8_1_mmq) == 4*QK8_1 + 4*sizeof(half2), "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
+static_assert(sizeof(block_mxfp8_mmq) == sizeof(block_q8_1_mmq),   "Unexpected block_mxfp8_mmq size");
 static_assert(sizeof(block_nvfp4_mmq) == sizeof(block_q8_1_mmq),   "Unexpected block_nvfp4_mmq size");
 static_assert(QK_MXFP6_E2M3_PTX_BYTES % 4 == 0,                   "MXFP6_E2M3 PTX bytes must be u32-loadable");
 static_assert(sizeof(tile_mxfp6_e2m3_mmq) == QK_MXFP6_E2M3_FRAGS*QK_MXFP6_E2M3_PTX_BYTES + QK_MXFP6_E2M3_FRAGS + 3, "Unexpected tile_mxfp6_e2m3_mmq size");
@@ -99,6 +104,8 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q8_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_MXFP4:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_MXFP8:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_MXFP6_E2M3:
             return MMQ_Q8_1_DS_LAYOUT_D4;
@@ -226,6 +233,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
+        case GGML_TYPE_MXFP8:   return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_MXFP6_E2M3:   return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
@@ -273,6 +281,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q8_0:    return MMQ_MMA_TILE_X_K_Q8_0;
         // tile sizes are the same for Q8_1 and FP4 for blackwell
         case GGML_TYPE_MXFP4:   return MMQ_MMA_TILE_X_K_Q8_1;
+        case GGML_TYPE_MXFP8:   return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_MXFP6_E2M3:   return MMQ_MMA_TILE_X_K_Q8_0;
 #if defined(BLACKWELL_MMA_AVAILABLE)
         case GGML_TYPE_NVFP4:   return MMQ_MMA_TILE_X_K_FP4;
@@ -995,6 +1004,106 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
+static __device__ __forceinline__ int mxfp8_pack4_i8(const uint32_t packed4) {
+    uint32_t out = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint8_t code = (packed4 >> (8 * i)) & 0xff;
+        const int q = max(-127, min(127, (int) roundf(ggml_cuda_e4m3_to_fp32(code) * 0.25f)));
+        out |= (uint32_t) (uint8_t) q << (8 * i);
+    }
+    return (int) out;
+}
+
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp8(
+        const char * __restrict__ x, int * __restrict__ x_tile,
+        const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int * x_qs = x_tile;
+    float * x_df = (float *) (x_qs + 2 * MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_MXFP8, mmq_y);
+    int * x_qs = x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif
+
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = threadIdx.x % threads_per_row;
+    const int frag = txi / 8;
+    const int word = txi % 8;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows * nwarps) {
+        int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        if constexpr (need_check) {
+            i = min(i, i_max);
+        }
+        const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i * stride;
+        const int q0 = mxfp8_pack4_i8(get_int_b4(bxi->qs[frag + 0], word));
+        const int q1 = mxfp8_pack4_i8(get_int_b4(bxi->qs[frag + 4], word));
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i * MMQ_MMA_TILE_X_K_Q8_0 + 0 + txi] = q0;
+        x_qs[i * MMQ_MMA_TILE_X_K_Q8_0 + MMQ_TILE_NE_K + txi] = q1;
+#else
+        x_qs[i * (2 * MMQ_TILE_NE_K + 1) + 0 + txi] = q0;
+        x_qs[i * (2 * MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = q1;
+#endif
+    }
+
+    const int kbxd = threadIdx.x % 8;
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * (warp_size / 8)) {
+        int i = i0 + threadIdx.y * (warp_size / 8) + threadIdx.x / 8;
+        if constexpr (need_check) {
+            i = min(i, i_max);
+        }
+        const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i * stride;
+        const float scale = ggml_cuda_e8m0_to_fp32(bxi->e[kbxd]) * 4.0f;
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i * MMQ_MMA_TILE_X_K_Q8_0 + kbxd] = scale;
+#else
+        x_df[i * (2 * MMQ_TILE_NE_K / QI8_0) + i / (QI8_0 / 2) + kbxd] = scale;
+#endif
+    }
+}
+
+template <int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_mxfp8_native(
+        const char * __restrict__ x, int * __restrict__ x_tile,
+        const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int sram_stride = MMQ_MMA_TILE_X_K_Q8_1;
+
+    int * x_qs = x_tile;
+    uint32_t * x_sc = (uint32_t *) (x_qs + 2 * MMQ_TILE_NE_K);
+    constexpr int ints_per_load = sizeof(uint2) / sizeof(int);
+    constexpr int threads_per_row = QK_MXFP8 / sizeof(uint2);
+    constexpr int rows_per_warp = warp_size / threads_per_row;
+    const int lane = threadIdx.x % threads_per_row;
+
+    static_assert(sizeof(block_mxfp8) % sizeof(uint2) == 0);
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / threads_per_row;
+        if constexpr (need_check) {
+            i = min(i, i_max);
+        }
+        const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i * stride;
+        const uint2 q = ((const uint2 *) bxi->qs)[lane];
+        int * dst = x_qs + i * sram_stride;
+        dst[ints_per_load * lane + 0] = q.x;
+        dst[ints_per_load * lane + 1] = q.y;
+        if (lane < QK_MXFP8 / QK_MXFP8_SUB) {
+            x_sc[i * sram_stride + lane] = bxi->e[lane];
+        }
+    }
+}
+
 template <int mmq_y, bool need_check>
 static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restrict__ x,
                                                             int * __restrict__ x_tile,
@@ -1040,6 +1149,71 @@ static __device__ __forceinline__ void load_tiles_mxfp4_fp4(const char * __restr
 }
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
+template <int mmq_x, int mmq_y>
+static __device__ __forceinline__ void vec_dot_mxfp8_mxfp8_mma(
+        const int * __restrict__ x, const int * __restrict__ y,
+        float * __restrict__ sum, const int k00) {
+    typedef tile<16, 8, int>   tile_A;
+    typedef tile<8, 8, int>    tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+    constexpr int stride = MMQ_MMA_TILE_X_K_Q8_1;
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+    constexpr int rows_per_warp = 2 * granularity;
+    constexpr int ntx = rows_per_warp / tile_C::I;
+    constexpr int nfrags = MMQ_TILE_NE_K / tile_A::J;
+
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+    const int * x_qs = x;
+    const uint32_t * x_sc = (const uint32_t *) (x_qs + 2 * MMQ_TILE_NE_K);
+    const int * y_qs = y + 4;
+    const uint32_t * y_sc = (const uint32_t *) y;
+    const int tidx_A = threadIdx.x / 4 + (threadIdx.x % 2) * 8;
+    const int tidx_B = threadIdx.x / 4;
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+    tile_A A[ntx][nfrags];
+    uint32_t scaleA[ntx][nfrags];
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            const int k0 = k00 + frag * tile_A::J;
+            load_ldmatrix(A[n][frag], x_qs + (i0 + n * tile_A::I) * stride + k0, stride);
+            scaleA[n][frag] = x_sc[(i0 + n * tile_A::I + tidx_A) * stride + k0 / tile_A::J];
+        }
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += ntx * tile_C::J) {
+        tile_B B[nfrags];
+        uint32_t scaleB[nfrags];
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            const int k0 = frag * tile_B::J;
+            load_generic(B[frag], y_qs + j0 * MMQ_TILE_Y_K + k0, MMQ_TILE_Y_K);
+            scaleB[frag] = y_sc[(j0 + tidx_B) * MMQ_TILE_Y_K + frag];
+        }
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            const int sum_offset = (j0 / tile_C::J + n) * tile_C::ne;
+            tile_C C;
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                C.x[l] = sum[sum_offset + l];
+            }
+#pragma unroll
+            for (int frag = 0; frag < nfrags; ++frag) {
+                mma_block_scaled_fp8_e4m3(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+            }
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                sum[sum_offset + l] = C.x[l];
+            }
+        }
+    }
+}
+
 // Shared MMA kernel for MXFP4 and NVFP4 on Blackwell.
 // Both quantizations encode values as e2m1 (FP4) and produce one uint32 scale per
 // m16n8k64 MMA call; only the PTX kind (scale_vec::2X ue8m0 vs scale_vec::4X ue4m3)
@@ -4197,6 +4371,20 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP4> {
 };
 
 template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP8> {
+    static constexpr int vdr = VDR_MXFP8_Q8_1_MMQ;
+#ifdef BLACKWELL_MMA_AVAILABLE
+    static constexpr load_tiles_mmq_t load_tiles = load_tiles_mxfp8_native<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t vec_dot_mma = vec_dot_mxfp8_mxfp8_mma<mmq_x, mmq_y>;
+#else
+    static constexpr load_tiles_mmq_t load_tiles = load_tiles_mxfp8<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t vec_dot_mma =
+        vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
+#endif
+    static constexpr vec_dot_mmq_t vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_MXFP6_E2M3> {
     static constexpr int              vdr          = VDR_MXFP6_E2M3_Q8_1_MMQ;
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_mxfp6<mmq_y, need_check>;
@@ -5461,12 +5649,14 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 #define DECL_MMQ_CASE(type)                                                        \
     template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
+extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_1);
 extern DECL_MMQ_CASE(GGML_TYPE_Q5_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q5_1);
 extern DECL_MMQ_CASE(GGML_TYPE_Q8_0);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
+extern DECL_MMQ_CASE(GGML_TYPE_MXFP8);
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP6_E2M3);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);

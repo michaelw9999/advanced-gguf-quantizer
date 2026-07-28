@@ -11,6 +11,7 @@
 #include <vector>
 
 static_assert(GGML_TYPE_Q2_0 == 42, "Q2_0 must keep its upstream GGUF type ID");
+static_assert(GGML_TYPE_MXFP8 == 43, "MXFP8 must keep its proposed GGUF type ID");
 static_assert(GGML_TYPE_MXFP6_E2M3 == 50, "MXFP6 must use its reserved public type ID");
 
 #if defined(_MSC_VER)
@@ -105,6 +106,52 @@ static float dot_product_error(const ggml_type_traits * qfns, const ggml_type_tr
     return fabsf(result - dot_ref) / test_size;
 }
 
+static bool test_mxfp8_contract(size_t test_size, const float * test_data1, const float * test_data2, bool verbose) {
+    const ggml_type type = GGML_TYPE_MXFP8;
+    const auto * qfns = ggml_get_type_traits(type);
+    const auto * qfns_cpu = ggml_get_type_traits_cpu(type);
+    const auto * q8_fns_cpu = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+    const size_t expected_bytes = test_size * 264 / 256;
+
+    if (qfns->blck_size != 256 || qfns->type_size != 264 || qfns->to_float == nullptr ||
+            qfns_cpu->vec_dot == nullptr || qfns_cpu->vec_dot_type != GGML_TYPE_Q8_0) {
+        fprintf(stderr, "MXFP8 type traits do not match the 256-value/264-byte contract\n");
+        return false;
+    }
+
+    std::vector<uint8_t> quantized(expected_bytes);
+    std::vector<uint8_t> q8(2 * test_size);
+    std::vector<float> dequantized(test_size);
+
+    const size_t written = ggml_quantize_chunk(type, test_data1, quantized.data(), 0, 1, test_size, nullptr);
+    if (written != expected_bytes || !ggml_validate_row_data(type, quantized.data(), written)) {
+        fprintf(stderr, "MXFP8 quantization wrote invalid row data\n");
+        return false;
+    }
+
+    qfns->to_float(quantized.data(), dequantized.data(), test_size);
+    double signal = 0.0;
+    double error = 0.0;
+    for (size_t i = 0; i < test_size; ++i) {
+        signal += test_data1[i] * test_data1[i];
+        const double diff = dequantized[i] - test_data1[i];
+        error += diff * diff;
+    }
+    const double nmse = signal > 0.0 ? error / signal : error;
+
+    q8_fns_cpu->from_float(test_data2, q8.data(), test_size);
+    float dot = INFINITY;
+    qfns_cpu->vec_dot(test_size, &dot, 0, quantized.data(), 0, q8.data(), 0, 1);
+    const float dot_error = fabsf(dot - dot_product(test_data1, test_data2, test_size)) / test_size;
+
+    const bool ok = nmse < 0.01 && dot_error < MAX_DOT_PRODUCT_ERROR;
+    if (!ok || verbose) {
+        printf("MXFP8 contract: %s (nmse=%f, dot_error=%f, bytes=%zu)\n",
+                RESULT_STR[!ok], nmse, dot_error, written);
+    }
+    return ok;
+}
+
 int main(int argc, char * argv[]) {
     bool verbose = false;
     const size_t test_size = 32 * 128;
@@ -131,6 +178,10 @@ int main(int argc, char * argv[]) {
 
     int num_failed = 0;
     bool failed = false;
+
+    if (!test_mxfp8_contract(test_size, test_data.data(), test_data2.data(), verbose)) {
+        ++num_failed;
+    }
 
     for (int i = 0; i < GGML_TYPE_COUNT; i++) {
         ggml_type type = (ggml_type) i;

@@ -1,8 +1,11 @@
 #include "common.cuh"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+#define MMVQ_MXFP8_MAX_ROWS 32
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_t ne01);
+
+bool ggml_cuda_should_use_mxfp8_mma_1col(enum ggml_type type, int cc, int64_t ne11, int64_t ne01);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
