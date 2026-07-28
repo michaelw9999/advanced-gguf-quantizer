@@ -2,8 +2,9 @@
 
 `advanced-gguf-quantizer` is a llama.cpp-derived, CUDA accelerated GGUF quantization toolkit for
 creating, inspecting, evaluating, improving, and testing GGUF models. The first
-focus initially was Blackwell NVFP4 and MXFP6, but now this quantizer has expanded
-psat that.  A BF16.gguf, imatrix and dataset, and kld file are all used together
+focus initially was Blackwell NVFP4 and MXFP6, but now this quantizer has
+expanded to OCP MXFP8 as well. A BF16 GGUF, imatrix, dataset, and KLD file are
+used together
 to search and tune for the best possible combination of scales and mixed tensor types.
 
 This tool is still in the absolute earliest stages of development and is still a rapidly changing work in progress.  More features and improvements are still on the way.
@@ -11,7 +12,7 @@ This tool is still in the absolute earliest stages of development and is still a
 A new strategy called Refined Scale Fit (RSF) is  used on Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, and NVFP4 for changing the scales and re-fitting using imatrix supported data.
 
 Logit KLD files are used during the process to tune and adjust through a series of candidate policies and different types of quantizations to determine which has the lowest error for that particular tensor and how the imatrix affects the ppl/kld data.  
-The tool will also self determine using a weighted score how to promote more error prone or sensitive tensors to higher bit GGUF types such as Q4_K, Q5_K, Q6_K, MXFP6 (not by default) or Q8_0 when the measured error profile justifies both bpw/size and speed tradeoff.
+The tool will also self determine using a weighted score how to promote more error prone or sensitive tensors to higher bit GGUF types such as Q4_K, Q5_K, Q6_K, MXFP6 (not by default), MXFP8, or Q8_0 when the measured error profile justifies both bpw/size and speed tradeoff.
 
 Models created with this tool are posted at:
 https://huggingface.co/michaelw9999
@@ -37,6 +38,12 @@ models created here may not work with future runtimes.
 
 MXFP6 is not enabled by default, but the tool can make MXFP6 quantizations and also use MXFP6 mixed with other tensor types in the model evaluation strategy.
 
+MXFP8 is the standard OCP MX E4M3 format: 32 E4M3 values share one E8M0
+scale. It is available as a direct 8.25 bpw GGUF profile with CPU and CUDA
+runtime support. Unlike the repository's MXFP6_E2M3 extension, MXFP8 is not a
+private experimental encoding.
+
+
 Feedback is requested. The latest full CUDA MXFP6 branch can be installed from
 <https://github.com/michaelw9999/llama.cpp/tree/mxfp6-cuda>.
 The initial llama.cpp MXFP6 CPU only PR is located at
@@ -44,7 +51,7 @@ The initial llama.cpp MXFP6 CPU only PR is located at
 
 ## What This Does
 
-- Designed to creates NVFP4, MXFP6, and mixed NVFP4/MXFP6 GGUFs with proper tensor and input scales.
+- Designed to create NVFP4, MXFP8, MXFP6, and mixed NVFP4/MXFP6 GGUFs with proper tensor and input scales.
 - Uses RSF (Refined Scale Fit) for supported K-quants and NVFP4 scale fitting.
 - Selects quantization types tensor-by-tensor based on set parameters/recipe or mode.
 - Offers `fast`, `normal`, and `deep` work modes for quantizer search depth.
@@ -167,6 +174,13 @@ Quality-first MoE model:
 ./build/bin/advanced-gguf-quantizer run recipes/moe.toml --project runs/moe --yes
 ```
 
+Direct OCP MXFP8 model:
+
+```bash
+./build/bin/advanced-gguf-quantizer recipe init --profile mxfp8 --output recipes/mxfp8.toml
+./build/bin/advanced-gguf-quantizer run recipes/mxfp8.toml --project runs/mxfp8 --yes
+```
+
 Repair or edit an existing GGUF:
 
 ```bash
@@ -177,12 +191,17 @@ Repair or edit an existing GGUF:
 Use `plan` to inspect a recipe. For model production, launch `run`; it writes
 real artifacts and does not waste time on fake quantization passes.
 
-## Choosing NVFP4, MXFP6, Or Mixed
+## Choosing NVFP4, MXFP8, MXFP6, Or Mixed
 
 `NVFP4` when smaller size and Blackwell speed matter most. It is the smallest
 advanced mode but has more quantization error, so quality runs should rely on
 imatrix, saved-logit KLD evidence, p99/p999 tails, and tensor-by-tensor
 promotions for more error prone or sensitive layers.
+
+`MXFP8` when a standardized microscaling E4M3 format and higher precision
+matter more than compact size. It uses 8.25 bpw, has CPU execution, and uses
+native scaled FP8 matrix paths on Blackwell CUDA where the operation shape
+allows it.
 
 `MXFP6_E2M3` when quality matters more than file size. It is larger than
 NVFP4 but useful for sensitive tensors, MoE experts, output/head tensors,
@@ -214,4 +233,5 @@ For KLD selector runs, choose a quantizer mode:
 - [CUDA acceleration guide](docs/advanced-gguf-quantizer-cuda-acceleration.md)
 - [Imatrix and KLD guide](docs/advanced-gguf-quantizer-imatrix-kld.md)
 - [NVFP4 GGUF contract](docs/advanced-gguf-quantizer-nvfp4-contract.md)
+- [MXFP8 GGUF contract](docs/advanced-gguf-quantizer-mxfp8-contract.md)
 - [AI agent guide](SKILLS.md)

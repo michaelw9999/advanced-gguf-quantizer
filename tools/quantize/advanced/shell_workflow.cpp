@@ -152,7 +152,7 @@ tui::ProductInfo shell_product() {
     tui::ProductInfo product;
     product.name = PRODUCT_NAME;
     product.version = PRODUCT_VERSION;
-    product.subtitle = "CUDA-only GGUF NVFP4 / experimental MXFP6 quantization shell";
+    product.subtitle = "GGUF NVFP4 / MXFP8 / experimental MXFP6 quantization shell";
     return product;
 }
 

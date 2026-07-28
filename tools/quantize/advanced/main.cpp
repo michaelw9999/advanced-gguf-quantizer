@@ -65,6 +65,7 @@ using bq::RunStatusThread;
 using bq::sanitize_tensor_type_token;
 using bq::set_if_empty;
 using bq::quant_type_uses_mxfp6;
+using bq::quant_type_uses_mxfp8;
 using bq::quant_type_uses_nvfp4;
 using bq::shellish_args;
 using bq::shell_clear;
@@ -114,7 +115,7 @@ static void usage() {
         "  advanced-gguf-quantizer project add-candidates <project.bwqproj> <manifest.jsonl>\n"
         "  advanced-gguf-quantizer project record-metrics <project.bwqproj> --variant ID --json '{...}'\n"
         "  advanced-gguf-quantizer project export-metrics <project.bwqproj> [--output metrics.jsonl]\n"
-        "  advanced-gguf-quantizer size --params-b N [--precision-mode NVFP4|MXFP6|NVFP4_MXFP6] [--vram-gb N] [--ram-gb N]\n"
+        "  advanced-gguf-quantizer size --params-b N [--precision-mode NVFP4|MXFP6|MXFP8|NVFP4_MXFP6] [--vram-gb N] [--ram-gb N]\n"
         "  advanced-gguf-quantizer run <recipe.toml> [--yes] [--project project] [--variant id] [--set path=value...]\n"
         "  advanced-gguf-quantizer shell\n"
         "  advanced-gguf-quantizer wizard [--output recipe.toml] [--run] [--yes]\n\n"
@@ -123,6 +124,7 @@ static void usage() {
         "profiles:\n"
         "  nvfp4\n"
         "  mxfp6\n"
+        "  mxfp8\n"
         "  nvfp4_mxfp6\n"
         "  mxfp6-primary\n"
         "  q8_0\n\n"
@@ -139,6 +141,7 @@ static void write_inspect_event(std::ofstream & events, const char * event, cons
            << ",\"tensors\":" << summary.tensors
            << ",\"nvfp4_tensors\":" << summary.nvfp4_tensors
            << ",\"mxfp6_e2m3_tensors\":" << summary.mxfp6_tensors
+           << ",\"mxfp8_tensors\":" << summary.mxfp8_tensors
            << ",\"scale_tensors\":" << summary.scale_tensors
            << ",\"input_scale_tensors\":" << summary.input_scale_tensors
            << ",\"has_mtp\":" << (summary.has_mtp ? "true" : "false")
@@ -365,6 +368,8 @@ static std::string profile_validation_summary(
     if (mtp_policy.empty()) {
         if (quant_type_uses_mxfp6(recipe.base.ftype) && !quant_type_uses_nvfp4(recipe.base.ftype)) {
             mtp_policy = "MXFP6_E2M3";
+        } else if (quant_type_uses_mxfp8(recipe.base.ftype)) {
+            mtp_policy = "MXFP8";
         } else if (expects_nvfp4) {
             mtp_policy = "NVFP4";
         } else {
@@ -403,6 +408,7 @@ static void write_assignment_jsonl(
         out << ",\"tensors\":" << output->tensors
             << ",\"nvfp4_tensors\":" << output->nvfp4_tensors
             << ",\"mxfp6_e2m3_tensors\":" << output->mxfp6_tensors
+            << ",\"mxfp8_tensors\":" << output->mxfp8_tensors
             << ",\"scale_tensors\":" << output->scale_tensors
             << ",\"input_scale_tensors\":" << output->input_scale_tensors
             << ",\"file_bytes\":" << output->file_bytes;
@@ -728,7 +734,8 @@ static void write_run_manifest_and_report(
     }
     if (output != nullptr) {
         report << "- Output tensors: `" << output->tensors << "`, NVFP4: `" << output->nvfp4_tensors
-               << "`, MXFP6_E2M3: `" << output->mxfp6_tensors << "`, scale tensors: `"
+               << "`, MXFP6_E2M3: `" << output->mxfp6_tensors << "`, MXFP8: `" << output->mxfp8_tensors
+               << "`, scale tensors: `"
                << output->scale_tensors << "`, input scales: `" << output->input_scale_tensors << "`\n";
     }
     report << "\n## Final PPL/KLD\n\n";
@@ -2606,6 +2613,9 @@ static double assumed_bpw_for_type(std::string type) {
     if (type == "mxfp6_e2m3") {
         return 6.62;
     }
+    if (type == "mxfp8" || type == "mxfp8_e4m3") {
+        return 8.25;
+    }
     return 0.0;
 }
 
@@ -2633,6 +2643,7 @@ static void apply_vram_target(
 
     const double nv4_gib = estimate_gib(params_b, 4.5);
     const double mx6_gib = estimate_gib(params_b, 6.62);
+    const double mx8_gib = estimate_gib(params_b, 8.25);
     const double usable_gib = vram_gb > 0 ? vram_gb * 0.88 : 0.0;
     const double weight_budget_gib = std::max(0.0, usable_gib - kv_cache_gib - activation_headroom_gib);
     const double target_bpw = params_b > 0.0 && weight_budget_gib > 0.0 ?
@@ -2651,7 +2662,8 @@ static void apply_vram_target(
     std::ostringstream note;
     note.setf(std::ios::fixed);
     note.precision(2);
-    note << "rough weights-only estimate: NVFP4=" << nv4_gib << " GiB, MXFP6=" << mx6_gib << " GiB";
+    note << "rough weights-only estimate: NVFP4=" << nv4_gib << " GiB, MXFP6=" << mx6_gib
+         << " GiB, MXFP8=" << mx8_gib << " GiB";
     if (vram_gb > 0) {
         note << ", target usable=" << usable_gib << " GiB"
              << ", weight budget=" << weight_budget_gib << " GiB"
@@ -2706,6 +2718,7 @@ static void apply_vram_target(
     alloc.precision(2);
     alloc << "; allocator types: NVFP4=" << assumed_bpw_for_type("NVFP4")
           << " bpw, MXFP6_E2M3=" << assumed_bpw_for_type("MXFP6_E2M3")
+          << " bpw, MXFP8=" << assumed_bpw_for_type("MXFP8")
           << " bpw, Q4_0=" << assumed_bpw_for_type("Q4_0")
           << " bpw, Q6_K=" << assumed_bpw_for_type("Q6_K")
           << " bpw, Q8_0=" << assumed_bpw_for_type("Q8_0")
@@ -2975,6 +2988,7 @@ static int size_main(int argc, char ** argv) {
     std::cout << recipe.target.sizing_note << "\n";
     std::cout << "estimated NVFP4 weights: " << estimate_gib(params_b, 4.5) << " GiB\n";
     std::cout << "estimated MXFP6 weights: " << estimate_gib(params_b, 6.62) << " GiB\n";
+    std::cout << "estimated MXFP8 weights: " << estimate_gib(params_b, 8.25) << " GiB\n";
     if (recipe.target.target_bpw > 0.0) {
         std::cout << "target average BPW: " << recipe.target.target_bpw << "\n";
     }
@@ -2986,6 +3000,7 @@ static int size_main(int argc, char ** argv) {
         std::cout << "inspected tensor bytes: " << mib_string(summary.tensor_bytes) << " MiB"
                   << ", NVFP4 tensors=" << summary.nvfp4_tensors
                   << ", MXFP6 tensors=" << summary.mxfp6_tensors
+                  << ", MXFP8 tensors=" << summary.mxfp8_tensors
                   << ", MTP=" << (summary.has_mtp ? "yes" : "no") << "\n";
     }
     return 0;

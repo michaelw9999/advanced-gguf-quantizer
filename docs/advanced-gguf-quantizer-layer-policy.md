@@ -9,12 +9,14 @@ extra bits only where evidence justifies them.
 - Preserve MTP and NextN tensors by default, including the whole appended
   decoder block on Qwen-style MTP models.
 - Use `base.mtp_tensor_type` / `--mtp-tensor-type` when a recipe deliberately
-  converts MTP matrix tensors. `NVFP4`, `MXFP6_E2M3`, `Q8_0`, `BF16`, and
-  `F16` are valid release choices.
+  converts MTP matrix tensors. `NVFP4`, `MXFP8`, `MXFP6_E2M3`, `Q8_0`,
+  `BF16`, and `F16` are valid release choices.
 - Keep token embeddings as `NVFP4` in pure NVFP4 artifacts.
 - A separate `output.weight` may use `Q6_K`, `Q8_0`, `BF16`, or another stronger
   type when the recipe asks for it.
 - Do not silently turn a tied token embedding into an output fallback type.
+- Use `MXFP8` for all matrix tensors in the direct MXFP8 profile unless the
+  recipe explicitly overrides embedding, output, or MTP policy.
 - Use `MXFP6_E2M3` only when a recipe or candidate assignment selects it.
 - Keep output/head choices explicit in the recipe and report.
 - Treat fallback types such as `MXFP6_E2M3`, `Q4_K`, `Q6_K`, `Q8_0`, `BF16`,

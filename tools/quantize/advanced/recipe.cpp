@@ -105,9 +105,10 @@ struct QuantTypeProfile {
     const char * profile;
 };
 
-static constexpr std::array<QuantTypeProfile, 3> QUANT_TYPE_PROFILES = {{
+static constexpr std::array<QuantTypeProfile, 4> QUANT_TYPE_PROFILES = {{
     { "NVFP4", "nvfp4" },
     { "MXFP6", "mxfp6" },
+    { "MXFP8", "mxfp8" },
     { "NVFP4_MXFP6", "nvfp4_mxfp6" },
 }};
 
@@ -568,6 +569,10 @@ static void dump_bool(std::ostringstream & out, const char * key, bool value) {
     }
 }
 
+static void dump_bool_explicit(std::ostringstream & out, const char * key, bool value) {
+    out << key << " = " << (value ? "true" : "false") << "\n";
+}
+
 static void dump_double(std::ostringstream & out, const char * key, double value) {
     if (value > 0.0) {
         out << key << " = " << value << "\n";
@@ -609,6 +614,9 @@ std::string canonical_quant_type(std::string value) {
     if (lower == "mxfp6" || lower == "mxfp6_e2m3") {
         return "MXFP6";
     }
+    if (lower == "mxfp8" || lower == "mxfp8_e4m3") {
+        return "MXFP8";
+    }
     if (lower == "q8" || lower == "q8_0") {
         return "Q8_0";
     }
@@ -641,6 +649,10 @@ bool quant_type_uses_nvfp4(const std::string & value) {
 bool quant_type_uses_mxfp6(const std::string & value) {
     const std::string quant_type = canonical_quant_type(value);
     return quant_type == "MXFP6" || quant_type == "NVFP4_MXFP6";
+}
+
+bool quant_type_uses_mxfp8(const std::string & value) {
+    return canonical_quant_type(value) == "MXFP8";
 }
 
 std::vector<std::string> quant_type_choices() {
@@ -736,8 +748,10 @@ std::vector<std::string> validate_recipe(const Recipe & recipe, bool require_io)
     const bool advanced_precision_quant =
         quant_type_uses_nvfp4(recipe.base.ftype) ||
         quant_type_uses_mxfp6(recipe.base.ftype) ||
+        quant_type_uses_mxfp8(recipe.base.ftype) ||
         quant_type_uses_nvfp4(recipe.target.precision_mode) ||
-        quant_type_uses_mxfp6(recipe.target.precision_mode);
+        quant_type_uses_mxfp6(recipe.target.precision_mode) ||
+        quant_type_uses_mxfp8(recipe.target.precision_mode);
     const std::string quantizer_mode = lower_copy(trim(recipe.quantizer.mode));
     if (quantizer_mode != "fast" &&
             quantizer_mode != "normal" &&
@@ -805,22 +819,22 @@ std::string dump_recipe_toml(const Recipe & r) {
     dump_string(out, "sizing_note", r.target.sizing_note);
 
     out << "\n[quantizer]\n";
-    dump_bool(out, "enabled", r.quantizer.enabled);
+    dump_bool_explicit(out, "enabled", r.quantizer.enabled);
     dump_string(out, "mode", r.quantizer.mode);
     dump_string(out, "objective", r.quantizer.objective);
     dump_string(out, "evidence", r.quantizer.evidence);
     dump_string(out, "policy_set", r.quantizer.policy_set);
-    dump_bool(out, "require_kld", r.quantizer.require_kld);
-    dump_bool(out, "require_corpus", r.quantizer.require_corpus);
-    dump_bool(out, "require_imatrix", r.quantizer.require_imatrix);
-    dump_bool(out, "allow_diagnostic", r.quantizer.allow_diagnostic);
+    dump_bool_explicit(out, "require_kld", r.quantizer.require_kld);
+    dump_bool_explicit(out, "require_corpus", r.quantizer.require_corpus);
+    dump_bool_explicit(out, "require_imatrix", r.quantizer.require_imatrix);
+    dump_bool_explicit(out, "allow_diagnostic", r.quantizer.allow_diagnostic);
 
     out << "\n[stock_ftype]\n";
     dump_string(out, "source", r.stock_ftype.source);
     dump_string(out, "mostly_type", r.stock_ftype.mostly_type);
-    dump_bool(out, "preserve_embeddings", r.stock_ftype.preserve_embeddings);
+    dump_bool_explicit(out, "preserve_embeddings", r.stock_ftype.preserve_embeddings);
     dump_string(out, "output_policy", r.stock_ftype.output_policy);
-    dump_bool(out, "sweep_tensor_policy", r.stock_ftype.sweep_tensor_policy);
+    dump_bool_explicit(out, "sweep_tensor_policy", r.stock_ftype.sweep_tensor_policy);
     dump_string_list(out, "token_embedding_candidates", r.stock_ftype.token_embedding_candidates);
     dump_string_list(out, "output_tensor_candidates", r.stock_ftype.output_tensor_candidates);
     dump_double(out, "min_quant_savings_mib", r.stock_ftype.min_quant_savings_mib);
@@ -1215,7 +1229,35 @@ static void apply_deep_quality_defaults(Recipe & r) {
 
 Recipe default_recipe(const std::string & profile) {
     Recipe r;
-    if (profile == "mxfp6") {
+    if (profile == "mxfp8") {
+        r.target.precision_mode = "MXFP8";
+        r.target.target_bpw = 8.25;
+        r.base.ftype = "MXFP8";
+        r.base.output_tensor_type = "MXFP8";
+        r.base.token_embedding_type = "MXFP8";
+        r.base.mtp_tensor_type = "MXFP8";
+        r.quantizer.enabled = false;
+        r.quantizer.objective.clear();
+        r.quantizer.evidence.clear();
+        r.quantizer.policy_set.clear();
+        r.quantizer.require_kld = false;
+        r.quantizer.require_corpus = false;
+        r.quantizer.require_imatrix = false;
+        clear_nvfp4_controls(r);
+        clear_mixed_controls(r);
+        clear_mxfp6_controls(r);
+        r.selector = {};
+        r.selector.effort.clear();
+        r.rescue.enabled = false;
+        r.rescue.type.clear();
+        r.stock_ftype.mostly_type = "MOSTLY_MXFP8";
+        r.stock_ftype.token_embedding_candidates = { "MXFP8" };
+        r.stock_ftype.output_tensor_candidates = { "MXFP8" };
+        r.stock_ftype.sweep_tensor_policy = false;
+        r.stock_ftype.sweep_sensitive_tensors = false;
+        r.stock_ftype.technique_candidates = { "ptq" };
+        r.stock_ftype.rationale = "OCP MXFP8 E4M3 recipe with one E8M0 scale per 32-value sub-block.";
+    } else if (profile == "mxfp6") {
         r.target.precision_mode = "MXFP6";
         r.base.ftype = "MXFP6";
         clear_nvfp4_controls(r);
@@ -1366,7 +1408,7 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
     const bool mixed_mx6_primary = quant_type == "NVFP4_MXFP6" && mixed_policy == "mx6_demote_nv4";
     const std::string ftype = r.base.copy_only ? "COPY" :
         (quant_type == "NVFP4_MXFP6" ? (mixed_mx6_primary ? "MXFP6" : "NVFP4_MXFP6") :
-            (quant_type == "NVFP4" || quant_type == "MXFP6" ? quant_type : r.base.ftype));
+            (quant_type == "NVFP4" || quant_type == "MXFP6" || quant_type == "MXFP8" ? quant_type : r.base.ftype));
     const bool uses_nvfp4 = quant_type == "NVFP4" || quant_type == "NVFP4_MXFP6" || ftype == "NVFP4";
     const bool uses_mxfp6 = quant_type == "MXFP6" || quant_type == "NVFP4_MXFP6" || ftype == "MXFP6";
     const bool use_mode_defaults = r.quantizer.enabled && !r.quantizer.allow_diagnostic;
@@ -1473,7 +1515,7 @@ std::vector<std::string> build_quantize_args(const Recipe & r, bool force_dry_ru
         push_pair("--selector-max-tensors", r.selector.max_tensors);
     }
     push_bool("--selector-trace", r.selector.trace);
-    if (!use_mode_defaults) {
+    if (r.quantizer.enabled && !use_mode_defaults) {
         push_pair("--selector-policy-threads", r.selector.policy_threads);
         push_pair("--selector-threads", r.selector.threads);
         push_pair("--selector-kld-threads", r.selector.kld_threads);

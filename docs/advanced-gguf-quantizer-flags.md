@@ -1,7 +1,8 @@
 # advanced-gguf-quantizer Flag And Workflow Guide
 
 This guide explains the public command surface, recipe fields, and quality
-controls for producing NVFP4, MXFP6_E2M3, and mixed NVFP4/MXFP6 GGUF models.
+controls for producing NVFP4, OCP MXFP8, MXFP6_E2M3, and mixed NVFP4/MXFP6
+GGUF models.
 Prefer recipes and project files over one-off shell state so runs are
 reproducible and resumable.
 
@@ -52,8 +53,9 @@ Core inputs:
   output/head and token embedding tensor types.
 - `base.mtp_tensor_type`: optional explicit MTP/NextN matrix tensor type.
   NVFP4 profiles default this to `NVFP4`; MXFP6 profiles default it to
-  `MXFP6_E2M3`. Norm/vector MTP tensors are still preserved.
-- `target.precision_mode`: `nvfp4`, `mxfp6`, `nvfp4_mxfp6`, or
+  `MXFP6_E2M3`; the MXFP8 profile defaults it to `MXFP8`. Norm/vector MTP
+  tensors are still preserved.
+- `target.precision_mode`: `nvfp4`, `mxfp8`, `mxfp6`, `nvfp4_mxfp6`, or
   `mxfp6-primary`.
 - `target.target_bpw`: final bits-per-weight goal for mixed allocation.
 - `target.vram_gb`: optional runtime budget for allocation choices.
@@ -108,6 +110,9 @@ Direct `llama-quantize` saved-logit selector runs use
 ## Profiles
 
 - `nvfp4`: compact Blackwell NVFP4 model with NVFP4 MTP matrix weights.
+- `mxfp8`: direct 8.25 bpw OCP MXFP8 E4M3 model with MXFP8 embeddings,
+  output, and MTP matrix weights. This direct profile does not require an
+  imatrix or saved-logit KLD base.
 - `mxfp6`: MXFP6_E2M3 model with MXFP6_E2M3 MTP matrix weights.
 - `nvfp4_mxfp6`: NVFP4-first mixed model that promotes sensitive tensors to
   MXFP6 or stronger fallback types while keeping MTP matrix weights NVFP4.

@@ -20,6 +20,7 @@ struct InspectSummary {
     uint64_t tensor_bytes = 0;
     int64_t nvfp4_tensors = 0;
     int64_t mxfp6_tensors = 0;
+    int64_t mxfp8_tensors = 0;
     int64_t scale_tensors = 0;
     int64_t input_scale_tensors = 0;
     bool has_mtp = false;

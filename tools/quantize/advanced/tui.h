@@ -57,7 +57,7 @@ struct BoxOptions {
 struct ProductInfo {
     std::string name = "advanced-gguf-quantizer";
     std::string version = "dev";
-    std::string subtitle = "CUDA-only GGUF NVFP4 / experimental MXFP6 quantization shell";
+    std::string subtitle = "GGUF NVFP4 / MXFP8 / experimental MXFP6 quantization shell";
 };
 
 struct StatusItem {

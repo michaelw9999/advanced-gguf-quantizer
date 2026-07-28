@@ -16,6 +16,9 @@ Start here:
   CUDA is used and what should stay CPU-side.
 - [NVFP4 GGUF contract](advanced-gguf-quantizer-nvfp4-contract.md): required
   NVFP4 tensors, scale meaning, runtime attachment, and validation.
+- [MXFP8 GGUF contract](advanced-gguf-quantizer-mxfp8-contract.md): OCP E4M3
+  block layout, GGUF identifiers, quantization policy, and CPU/CUDA runtime
+  support.
 
 Root documents:
 

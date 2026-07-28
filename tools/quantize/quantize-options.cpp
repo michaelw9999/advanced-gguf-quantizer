@@ -98,6 +98,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "NVFP4_MXFP6", LLAMA_FTYPE_MOSTLY_NVFP4, " NVFP4 with measured MXFP6 tensor promotion", },
     { "MXFP6",    LLAMA_FTYPE_MOSTLY_MXFP6_E2M3, " MXFP6 E2M3",  },
     { "MXFP6_E2M3", LLAMA_FTYPE_MOSTLY_MXFP6_E2M3, "alias for MXFP6",  },
+    { "MXFP8",    LLAMA_FTYPE_MOSTLY_MXFP8,    " 8.25 bpw OCP MX E4M3 quantization", },
     { "Q5_0",     LLAMA_FTYPE_MOSTLY_Q5_0,     " 5.21G, +0.1316 ppl @ Llama-3-8B",  },
     { "Q5_1",     LLAMA_FTYPE_MOSTLY_Q5_1,     " 5.65G, +0.1062 ppl @ Llama-3-8B",  },
     { "IQ2_XXS",  LLAMA_FTYPE_MOSTLY_IQ2_XXS,  " 2.06 bpw quantization",            },

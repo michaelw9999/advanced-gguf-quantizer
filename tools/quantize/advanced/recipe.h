@@ -241,6 +241,7 @@ std::string canonical_quant_type(std::string value);
 std::string sanitize_tensor_type_token(std::string value);
 bool quant_type_uses_nvfp4(const std::string & value);
 bool quant_type_uses_mxfp6(const std::string & value);
+bool quant_type_uses_mxfp8(const std::string & value);
 std::vector<std::string> quant_type_choices();
 Recipe default_recipe();
 Recipe default_recipe(const std::string & profile);

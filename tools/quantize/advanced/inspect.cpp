@@ -207,6 +207,8 @@ InspectSummary inspect_gguf(const std::string & path) {
             ++summary.nvfp4_tensors;
         } else if (type == GGML_TYPE_MXFP6_E2M3) {
             ++summary.mxfp6_tensors;
+        } else if (type == GGML_TYPE_MXFP8) {
+            ++summary.mxfp8_tensors;
         }
         if (name.size() >= 6 && name.compare(name.size() - 6, 6, ".scale") == 0) {
             ++summary.scale_tensors;
@@ -273,6 +275,7 @@ int inspect_main(int argc, char ** argv) {
         std::cout << "  \"tensor_bytes\": " << summary.tensor_bytes << ",\n";
         std::cout << "  \"nvfp4_tensors\": " << summary.nvfp4_tensors << ",\n";
         std::cout << "  \"mxfp6_e2m3_tensors\": " << summary.mxfp6_tensors << ",\n";
+        std::cout << "  \"mxfp8_tensors\": " << summary.mxfp8_tensors << ",\n";
         std::cout << "  \"scale_tensors\": " << summary.scale_tensors << ",\n";
         std::cout << "  \"input_scale_tensors\": " << summary.input_scale_tensors << ",\n";
         std::cout << "  \"has_mtp\": " << (summary.has_mtp ? "true" : "false") << ",\n";
@@ -300,6 +303,7 @@ int inspect_main(int argc, char ** argv) {
     std::cout << "tensors: " << summary.tensors << " (" << human_bytes(summary.tensor_bytes) << " tensor payload)\n";
     std::cout << "blackwell: NVFP4=" << summary.nvfp4_tensors
               << " MXFP6_E2M3=" << summary.mxfp6_tensors
+              << " MXFP8=" << summary.mxfp8_tensors
               << " .scale=" << summary.scale_tensors
               << " .input_scale=" << summary.input_scale_tensors << "\n";
     std::cout << "mtp: " << (summary.has_mtp ? "present" : "not found")
