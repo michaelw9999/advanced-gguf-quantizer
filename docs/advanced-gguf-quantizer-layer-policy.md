@@ -26,6 +26,11 @@ MXFP6_E2M3 is experimental and unsupported by NVIDIA and llama.cpp. Future
 official support may use a different format, so mixed or MXFP6-primary GGUFs
 created here may not remain compatible with future runtimes.
 
+GGUF type ID 42 is reserved for upstream `Q2_0`. This repository writes
+maintainer-owned `MXFP6_E2M3` tensor and file types as ID 50. Older MXFP6 files
+that used tensor ID 42 or the briefly used local ID 44 must be migrated or
+regenerated so they cannot be misread as Q2_0.
+
 ## Fused Decision Units
 
 The allocator should make coherent decisions for related tensors before using

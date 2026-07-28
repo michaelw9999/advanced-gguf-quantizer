@@ -43,6 +43,9 @@ scale. It is available as a direct 8.25 bpw GGUF profile with CPU and CUDA
 runtime support. Unlike the repository's MXFP6_E2M3 extension, MXFP8 is not a
 private experimental encoding.
 
+MXFP6_E2M3 uses maintainer-owned GGUF tensor and file type ID 50. Older MXFP6
+artifacts that used tensor type ID 42 must be migrated or regenerated because
+upstream llama.cpp now assigns tensor type ID 42 to Q2_0.
 
 Feedback is requested. The latest full CUDA MXFP6 branch can be installed from
 <https://github.com/michaelw9999/llama.cpp/tree/mxfp6-cuda>.
