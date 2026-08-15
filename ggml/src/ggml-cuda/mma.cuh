@@ -1197,6 +1197,14 @@ namespace ggml_cuda_mma {
 #endif // BLACKWELL_MMA_AVAILABLE
     }
 
+    static __device__ __forceinline__ void mma_block_scaled_mxfp8(tile<16, 8, float> &     D,
+                                                                 const tile<16, 8, int> & A,
+                                                                 const tile<8, 8, int> &  B,
+                                                                 uint32_t                 a_scale,
+                                                                 uint32_t                 b_scale) {
+        mma_block_scaled_fp8_e4m3(D, A, B, a_scale, b_scale);
+    }
+
     static __device__ __forceinline__ void mma_block_scaled_mxfp6_e2m3_mxfp4_e2m1(tile<16, 8, float> &     D,
                                                                                   const tile<16, 8, int> & A,
                                                                                   const tile<8, 8, int> &  B,

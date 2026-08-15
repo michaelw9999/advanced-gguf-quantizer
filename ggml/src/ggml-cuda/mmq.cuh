@@ -1076,32 +1076,34 @@ static __device__ __forceinline__ void load_tiles_mxfp8_native(
         const char * __restrict__ x, int * __restrict__ x_tile,
         const int kbx0, const int i_max, const int stride) {
     constexpr int nwarps = mmq_get_nwarps_device();
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int sram_stride = MMQ_MMA_TILE_X_K_Q8_1;
 
-    int * x_qs = x_tile;
+    int *      x_qs = x_tile;
     uint32_t * x_sc = (uint32_t *) (x_qs + 2 * MMQ_TILE_NE_K);
-    constexpr int ints_per_load = sizeof(uint2) / sizeof(int);
-    constexpr int threads_per_row = QK_MXFP8 / sizeof(uint2);
-    constexpr int rows_per_warp = warp_size / threads_per_row;
-    const int lane = threadIdx.x % threads_per_row;
 
-    static_assert(sizeof(block_mxfp8) % sizeof(uint2) == 0);
+    const mxfp8_tile * __restrict__ tiles = (const mxfp8_tile *) x;
+    const int lane = int(threadIdx.x);
+
 #pragma unroll
-    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * rows_per_warp) {
-        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / threads_per_row;
-        if constexpr (need_check) {
-            i = min(i, i_max);
-        }
-        const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i * stride;
-        const uint2 q = ((const uint2 *) bxi->qs)[lane];
-        int * dst = x_qs + i * sram_stride;
-        dst[ints_per_load * lane + 0] = q.x;
-        dst[ints_per_load * lane + 1] = q.y;
-        if (lane < QK_MXFP8 / QK_MXFP8_SUB) {
-            x_sc[i * sram_stride + lane] = bxi->e[lane];
+    for (int i0 = int(threadIdx.y) * MXFP8_MMA_TILE_ROWS; i0 < mmq_y; i0 += nwarps * MXFP8_MMA_TILE_ROWS) {
+        const int64_t tile = kbx0 + int64_t(i0 / MXFP8_MMA_TILE_ROWS) * stride;
+        const int row_lo = i0 + (lane >> 2);
+        const int row_hi = row_lo + 8;
+        const int word   = lane & 3;
+
+#pragma unroll
+        for (int frag = 0; frag < QK_MXFP8_FRAGS; ++frag) {
+            const uint4 packed = tiles[tile].qs[frag][lane];
+            x_qs[row_lo * sram_stride + frag * 8 + word + 0] = int(packed.x);
+            x_qs[row_hi * sram_stride + frag * 8 + word + 0] = int(packed.y);
+            x_qs[row_lo * sram_stride + frag * 8 + word + 4] = int(packed.z);
+            x_qs[row_hi * sram_stride + frag * 8 + word + 4] = int(packed.w);
+            if (lane < MXFP8_MMA_TILE_ROWS) {
+                x_sc[(i0 + lane) * sram_stride + frag] = tiles[tile].sc[frag][lane];
+            }
         }
     }
+    GGML_UNUSED(i_max);
 }
 
 template <int mmq_y, bool need_check>

@@ -484,46 +484,33 @@ static __device__ __forceinline__ float ggml_cuda_mmvq_apply_glu(
 
 static __device__ __forceinline__ void load_mxfp8_tileA_1col_mmvq(
         ggml_cuda_mma::tile<16, 8, int> & A, uint32_t & scaleA,
-        const block_mxfp8 * __restrict__ x, const int stride_row_x, const int frag_abs32) {
-    const int lane      = int(threadIdx.x) & 31;
-    const int row_lo    = lane >> 2;
-    const int row_hi    = row_lo + 8;
-    const int word      = lane & 3;
-    const int block_rel = frag_abs32 >> 3;
-    const int frag_idx  = frag_abs32 & 7;
-
-    const block_mxfp8 & block_lo = x[row_lo * stride_row_x + block_rel];
-    const block_mxfp8 & block_hi = x[row_hi * stride_row_x + block_rel];
-    const uint32_t * q_lo = reinterpret_cast<const uint32_t *>(block_lo.qs[frag_idx]);
-    const uint32_t * q_hi = reinterpret_cast<const uint32_t *>(block_hi.qs[frag_idx]);
-
+        const mxfp8_tile * __restrict__ tile,
+        int row_lo, int row_hi, int frag, int word) {
+    const uint4 packed = tile->qs[frag][ggml_cuda_mxfp8_frag_lane(row_lo, word)];
     int * ax = reinterpret_cast<int *>(A.x);
-    ax[0] = int(q_lo[word]);
-    ax[1] = int(q_hi[word]);
-    ax[2] = int(q_lo[word + 4]);
-    ax[3] = int(q_hi[word + 4]);
-
-    const uint64_t e8 = *reinterpret_cast<const uint64_t *>((lane & 1 ? block_hi : block_lo).e);
-    scaleA = (e8 >> (8 * frag_idx)) & 0xFFu;
+    ax[0] = packed.x;
+    ax[1] = packed.y;
+    ax[2] = packed.z;
+    ax[3] = packed.w;
+    scaleA = uint32_t(tile->sc[frag][row_lo]) | (uint32_t(tile->sc[frag][row_hi]) << 16);
 }
 
 static __device__ __forceinline__ void load_mxfp8_tileB_1col_mmvq(
         ggml_cuda_mma::tile<8, 8, int> & B, uint32_t & scaleB,
-        const block_mxfp8_mmq * __restrict__ y, const int frag_abs32) {
-    const int lane      = int(threadIdx.x) & 31;
-    const int block_rel = frag_abs32 >> 2;
-    const int frag_idx  = frag_abs32 & 3;
+        const block_mxfp8_mmq * __restrict__ y, const int frag) {
+    const int lane = int(threadIdx.x) & 31;
     int * bx = reinterpret_cast<int *>(B.x);
     uint32_t scale = 0x7Fu;
 
     if (lane < 4) {
-        const block_mxfp8_mmq & block = y[block_rel];
-        const uint32_t * q = reinterpret_cast<const uint32_t *>(block.qs + frag_idx * QK_MXFP8_SUB);
+        const block_mxfp8_mmq & block = y[frag >> 2];
+        const int frag_in_block = frag & 3;
+        const uint32_t * q = reinterpret_cast<const uint32_t *>(block.qs + frag_in_block * QK_MXFP8_SUB);
         bx[0] = int(q[lane]);
         bx[1] = int(q[lane + 4]);
         if (lane == 0) {
             const uint32_t d4 = *reinterpret_cast<const uint32_t *>(block.d4);
-            scale = (d4 >> (8 * frag_idx)) & 0xFFu;
+            scale = (d4 >> (8 * frag_in_block)) & 0xFFu;
         }
     } else {
         bx[0] = 0;
@@ -538,11 +525,11 @@ static __device__ __forceinline__ void load_mxfp8_tileB_1col_mmvq(
 template <int warps_per_tile, bool has_gate, bool has_x_bias, bool has_gate_bias>
 static __global__ __launch_bounds__(32 * warps_per_tile, GGML_CUDA_MXFP8_1COL_MIN_BLOCKS(warps_per_tile))
 void mul_mat_vec_mxfp8_mma_1col(
-        const block_mxfp8 * __restrict__ vx, const block_mxfp8 * __restrict__ vgate,
+        const mxfp8_tile * __restrict__ vx, const mxfp8_tile * __restrict__ vgate,
         const block_mxfp8_mmq * __restrict__ y,
         const float * __restrict__ x_bias, const float * __restrict__ gate_bias,
         const ggml_glu_op glu_op, float * __restrict__ dst, const int nfrags32,
-        const int stride_row_x, const int stride_channel_x, const int stride_sample_x,
+        const int tiles_per_row, const int tile_stride_channel, const int tile_stride_sample,
         const int stride_channel_y, const int stride_sample_y,
         const int stride_channel_dst, const int stride_sample_dst,
         const int channel_ratio, const int sample_ratio) {
@@ -552,36 +539,50 @@ void mul_mat_vec_mxfp8_mma_1col(
     typedef tile<16, 8, float> tile_C;
 
     const int row_base    = 16 * int(blockIdx.x);
+    const int tile_row    = int(blockIdx.x);
     const int channel_dst = int(blockIdx.y);
     const int sample_dst  = int(blockIdx.z);
     const int channel_x   = channel_ratio == 1 ? channel_dst : channel_dst / channel_ratio;
     const int sample_x    = sample_ratio == 1 ? sample_dst : sample_dst / sample_ratio;
     const int tile_offset =
-        sample_x * stride_sample_x + channel_x * stride_channel_x + row_base * stride_row_x;
+        sample_x * tile_stride_sample + channel_x * tile_stride_channel + tile_row * tiles_per_row;
 
-    const block_mxfp8 * x = vx + tile_offset;
-    const block_mxfp8 * gate = has_gate ? vgate + tile_offset : nullptr;
+    const mxfp8_tile * x = vx + tile_offset;
+    const mxfp8_tile * gate = has_gate ? vgate + tile_offset : nullptr;
     const block_mxfp8_mmq * y_cur =
         y + sample_dst * stride_sample_y + channel_dst * stride_channel_y;
 
     const int lane    = int(threadIdx.x);
     const int warp_id = int(threadIdx.y);
+    const int row_lo  = lane >> 2;
+    const int row_hi  = row_lo + 8;
+    const int word    = lane & 3;
     tile_C C = {};
     tile_C gate_C = {};
 
-    for (int frag = warp_id; frag < nfrags32; frag += warps_per_tile) {
-        tile_B B;
-        uint32_t scaleB;
-        load_mxfp8_tileB_1col_mmvq(B, scaleB, y_cur, frag);
+    for (int frag = 2 * warp_id; frag < nfrags32; frag += 2 * warps_per_tile) {
+        tile_B B0, B1;
+        uint32_t scaleB0, scaleB1;
+        load_mxfp8_tileB_1col_mmvq(B0, scaleB0, y_cur, frag + 0);
+        load_mxfp8_tileB_1col_mmvq(B1, scaleB1, y_cur, frag + 1);
 
-        tile_A A;
-        uint32_t scaleA;
-        load_mxfp8_tileA_1col_mmvq(A, scaleA, x, stride_row_x, frag);
-        mma_block_scaled_fp8_e4m3(C, A, B, scaleA, scaleB);
+        const mxfp8_tile * tile_cur = x + (frag >> 3);
+        const int frag_in_tile = frag & 7;
+
+        tile_A A0, A1;
+        uint32_t scaleA0, scaleA1;
+        load_mxfp8_tileA_1col_mmvq(A0, scaleA0, tile_cur, row_lo, row_hi, frag_in_tile + 0, word);
+        load_mxfp8_tileA_1col_mmvq(A1, scaleA1, tile_cur, row_lo, row_hi, frag_in_tile + 1, word);
+
+        mma_block_scaled_mxfp8(C, A0, B0, scaleA0, scaleB0);
+        mma_block_scaled_mxfp8(C, A1, B1, scaleA1, scaleB1);
 
         if constexpr (has_gate) {
-            load_mxfp8_tileA_1col_mmvq(A, scaleA, gate, stride_row_x, frag);
-            mma_block_scaled_fp8_e4m3(gate_C, A, B, scaleA, scaleB);
+            const mxfp8_tile * gate_tile = gate + (frag >> 3);
+            load_mxfp8_tileA_1col_mmvq(A0, scaleA0, gate_tile, row_lo, row_hi, frag_in_tile + 0, word);
+            load_mxfp8_tileA_1col_mmvq(A1, scaleA1, gate_tile, row_lo, row_hi, frag_in_tile + 1, word);
+            mma_block_scaled_mxfp8(gate_C, A0, B0, scaleA0, scaleB0);
+            mma_block_scaled_mxfp8(gate_C, A1, B1, scaleA1, scaleB1);
         }
     }
 
@@ -626,10 +627,10 @@ void mul_mat_vec_mxfp8_mma_1col(
 
 template <int warps_per_tile>
 static void launch_mul_mat_vec_mxfp8_mma_1col(
-        const block_mxfp8 * src0, const ggml_cuda_mm_fusion_args_device & fusion,
+        const mxfp8_tile * src0, const ggml_cuda_mm_fusion_args_device & fusion,
         const block_mxfp8_mmq * src1, float * dst, const int nfrags32,
         const int nrows, const int nchannels_dst, const int nsamples_dst,
-        const int stride_row_x, const int stride_channel_x, const int stride_sample_x,
+        const int tiles_per_row, const int tile_stride_channel, const int tile_stride_sample,
         const int stride_channel_y, const int stride_sample_y,
         const int stride_channel_dst, const int stride_sample_dst,
         const int channel_ratio, const int sample_ratio, cudaStream_t stream) {
@@ -639,34 +640,34 @@ static void launch_mul_mat_vec_mxfp8_mma_1col(
     if (fusion.gate != nullptr) {
         if (fusion.x_bias != nullptr && fusion.gate_bias != nullptr) {
             mul_mat_vec_mxfp8_mma_1col<warps_per_tile, true, true, true><<<block_nums, block_dims, 0, stream>>>(
-                src0, (const block_mxfp8 *) fusion.gate, src1,
+                src0, (const mxfp8_tile *) fusion.gate, src1,
                 (const float *) fusion.x_bias, (const float *) fusion.gate_bias, fusion.glu_op, dst, nfrags32,
-                stride_row_x, stride_channel_x, stride_sample_x, stride_channel_y, stride_sample_y,
+                tiles_per_row, tile_stride_channel, tile_stride_sample, stride_channel_y, stride_sample_y,
                 stride_channel_dst, stride_sample_dst, channel_ratio, sample_ratio);
         } else if (fusion.x_bias != nullptr) {
             mul_mat_vec_mxfp8_mma_1col<warps_per_tile, true, true, false><<<block_nums, block_dims, 0, stream>>>(
-                src0, (const block_mxfp8 *) fusion.gate, src1,
+                src0, (const mxfp8_tile *) fusion.gate, src1,
                 (const float *) fusion.x_bias, nullptr, fusion.glu_op, dst, nfrags32,
-                stride_row_x, stride_channel_x, stride_sample_x, stride_channel_y, stride_sample_y,
+                tiles_per_row, tile_stride_channel, tile_stride_sample, stride_channel_y, stride_sample_y,
                 stride_channel_dst, stride_sample_dst, channel_ratio, sample_ratio);
         } else if (fusion.gate_bias != nullptr) {
             mul_mat_vec_mxfp8_mma_1col<warps_per_tile, true, false, true><<<block_nums, block_dims, 0, stream>>>(
-                src0, (const block_mxfp8 *) fusion.gate, src1,
+                src0, (const mxfp8_tile *) fusion.gate, src1,
                 nullptr, (const float *) fusion.gate_bias, fusion.glu_op, dst, nfrags32,
-                stride_row_x, stride_channel_x, stride_sample_x, stride_channel_y, stride_sample_y,
+                tiles_per_row, tile_stride_channel, tile_stride_sample, stride_channel_y, stride_sample_y,
                 stride_channel_dst, stride_sample_dst, channel_ratio, sample_ratio);
         } else {
             mul_mat_vec_mxfp8_mma_1col<warps_per_tile, true, false, false><<<block_nums, block_dims, 0, stream>>>(
-                src0, (const block_mxfp8 *) fusion.gate, src1,
+                src0, (const mxfp8_tile *) fusion.gate, src1,
                 nullptr, nullptr, fusion.glu_op, dst, nfrags32,
-                stride_row_x, stride_channel_x, stride_sample_x, stride_channel_y, stride_sample_y,
+                tiles_per_row, tile_stride_channel, tile_stride_sample, stride_channel_y, stride_sample_y,
                 stride_channel_dst, stride_sample_dst, channel_ratio, sample_ratio);
         }
     } else {
         GGML_ASSERT(fusion.x_bias == nullptr && fusion.gate_bias == nullptr);
         mul_mat_vec_mxfp8_mma_1col<warps_per_tile, false, false, false><<<block_nums, block_dims, 0, stream>>>(
             src0, nullptr, src1, nullptr, nullptr, fusion.glu_op, dst, nfrags32,
-            stride_row_x, stride_channel_x, stride_sample_x, stride_channel_y, stride_sample_y,
+            tiles_per_row, tile_stride_channel, tile_stride_sample, stride_channel_y, stride_sample_y,
             stride_channel_dst, stride_sample_dst, channel_ratio, sample_ratio);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -3767,11 +3768,15 @@ void ggml_cuda_mul_mat_vec_q(
                 GGML_ASSERT(ncols_dst == 1 && ne00 % QK_MXFP8 == 0);
                 GGML_ASSERT(nchannels_dst % ne02 == 0 && ne3 % ne03 == 0);
                 constexpr int warps_per_tile = 16;
+                const int     tiles_per_row = int(ggml_cuda_mxfp8_blocks_per_row(ne00));
+                const int     tile_stride_channel = int(ggml_cuda_mxfp8_tile_rows(ne01)) * tiles_per_row;
+                const int     tile_stride_sample  = int(ne02) * tile_stride_channel;
                 launch_mul_mat_vec_mxfp8_mma_1col<warps_per_tile>(
-                    (const block_mxfp8 *) src0_data, fusion_local,
+                    (const mxfp8_tile *) src0_data, fusion_local,
                     (const block_mxfp8_mmq *) src1_t.get(), dst_d,
                     int(ne00 / QK_MXFP8_SUB), int(ne01), int(nchannels_dst), int(ne3),
-                    int(s01), int(s02), int(s03), int(stride_channel_y), int(stride_sample_y),
+                    tiles_per_row, tile_stride_channel, tile_stride_sample,
+                    int(stride_channel_y), int(stride_sample_y),
                     int(stride_channel_dst), int(s3), int(nchannels_dst / ne02), int(ne3 / ne03), stream);
                 return;
             }

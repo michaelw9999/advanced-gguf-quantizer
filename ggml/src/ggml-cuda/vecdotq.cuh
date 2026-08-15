@@ -334,22 +334,23 @@ static __device__ __forceinline__ float vec_dot_mxfp8_q8_1(
     const block_mxfp8 * bq8x = (const block_mxfp8 *) vbq + kbx;
     const int frag = iqs >> 3;
     const int word = iqs & 7;
-    int sumi = 0;
+    float sumf = 0.0f;
 #pragma unroll
     for (int l = 0; l < VDR_MXFP8_Q8_1_MMVQ; ++l) {
-        const uint32_t x4 = get_int_b4(bq8x->qs[frag], word + l);
+        const uint32_t x4 = ggml_cuda_e4m3x4_clear_nan(get_int_b4(bq8x->qs[frag], word + l));
         const uint32_t y4 = get_int_b4(bq8_1[frag].qs, word + l);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const uint8_t xcode = x4 >> (8 * i);
-            const int8_t yq = y4 >> (8 * i);
-            sumi += ggml_cuda_e4m3_to_i32_x512(xcode) * yq;
-        }
+        const float2 x_lo = ggml_cuda_e4m3x2_to_fp32x2(x4);
+        const float2 x_hi = ggml_cuda_e4m3x2_to_fp32x2(x4 >> 16);
+        const float y0 = float((int8_t) (y4 >>  0));
+        const float y1 = float((int8_t) (y4 >>  8));
+        const float y2 = float((int8_t) (y4 >> 16));
+        const float y3 = float((int8_t) (y4 >> 24));
+        sumf += x_lo.x * y0 + x_lo.y * y1 + x_hi.x * y2 + x_hi.y * y3;
     }
 
     const float d = ggml_cuda_e8m0_to_fp32(bq8x->e[frag]) *
-        __low2float(bq8_1[frag].ds) * (1.0f / 512.0f);
-    return d * sumi;
+        __low2float(bq8_1[frag].ds);
+    return d * sumf;
 }
 
 static __device__ __forceinline__ int mxfp6_e2m3_pack4_i8x8(const uint32_t packed4) {

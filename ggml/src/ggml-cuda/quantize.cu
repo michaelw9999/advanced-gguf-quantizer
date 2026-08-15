@@ -442,6 +442,7 @@ static __global__ void quantize_mmq_fp8_e4m3(const float * __restrict__ x,
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
+template <bool scatter>
 static __global__ void quantize_mmq_mxfp8(
         const float * __restrict__ x, const int32_t * __restrict__ ids,
         void * __restrict__ vy, const int64_t ne00,
@@ -457,7 +458,7 @@ static __global__ void quantize_mmq_mxfp8(
     const int64_t i1 = blockIdx.x;
     const int64_t i2 = blockIdx.z % ne2;
     const int64_t i3 = blockIdx.z / ne2;
-    const int64_t i01 = ids ? ids[i1] : i1;
+    const int64_t i01 = scatter ? ids[i1] : (ids ? ids[i1] : i1);
     const int64_t base_idx = i3 * s03 + i2 * s02 + i01 * s01;
 
     const float4 xi = i0 < ne00 ?
@@ -832,7 +833,24 @@ void quantize_mmq_mxfp8_cuda(
         (ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2 * ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
-    quantize_mmq_mxfp8<<<num_blocks, block_size, 0, stream>>>(
+    quantize_mmq_mxfp8<false><<<num_blocks, block_size, 0, stream>>>(
+        x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+}
+
+void quantize_scatter_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP8);
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % (4 * QK8_1) == 0);
+    GGML_ASSERT(ids != nullptr);
+
+    const int64_t block_num_y =
+        (ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, ne2 * ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_mxfp8<true><<<num_blocks, block_size, 0, stream>>>(
         x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
 }
 

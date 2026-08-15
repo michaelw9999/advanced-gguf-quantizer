@@ -189,6 +189,7 @@ void ggml_cuda_mul_mat_q(
 #if defined(BLACKWELL_MMA_AVAILABLE)
     const bool use_nvfp4_layout = src0->type == GGML_TYPE_NVFP4;
     const bool use_mxfp6_layout = use_native_mxfp6;
+    const bool use_mxfp8_layout = use_native_mxfp8;
     if (use_nvfp4_layout) {
         s01_mmq = ggml_cuda_nvfp4_blocks_per_row(ne00);
         s02_mmq = ggml_cuda_bw_div_up(ne01, 16) * s01_mmq;
@@ -196,6 +197,10 @@ void ggml_cuda_mul_mat_q(
     } else if (use_mxfp6_layout) {
         s01_mmq = ggml_cuda_mxfp6_e2m3_blocks_per_row(ne00);
         s02_mmq = ggml_cuda_bw_div_up(ne01, 16) * s01_mmq;
+        s03_mmq = (s03 / s02) * s02_mmq;
+    } else if (use_mxfp8_layout) {
+        s01_mmq = ggml_cuda_mxfp8_blocks_per_row(ne00);
+        s02_mmq = ggml_cuda_mxfp8_tile_rows(ne01) * s01_mmq;
         s03_mmq = (s03 / s02) * s02_mmq;
     }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)

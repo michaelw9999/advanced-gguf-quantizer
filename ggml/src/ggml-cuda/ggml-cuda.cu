@@ -930,6 +930,95 @@ static bool ggml_cuda_get_tensor_mxfp6(const ggml_tensor * tensor, void * data, 
     return true;
 }
 
+// Permute MXFP8 weights into the m16n8k32 A-fragment order once, when the tensor is uploaded.
+// Codes and scales go to separate planes and the last 16-row tile is padded, so every MXFP8
+// weight ends up in the same layout regardless of its row count.
+static __global__ void ggml_cuda_repack_mxfp8_tiles(
+        const block_mxfp8 * __restrict__ src, mxfp8_tile * __restrict__ dst,
+        const int64_t blocks_per_row, const int64_t tile_rows, const int64_t ne1) {
+    const int     lane = int(threadIdx.x);
+    const int     frag = int(threadIdx.y);
+    const int64_t tile = int64_t(blockIdx.x);
+
+    const int64_t tiles_per_plane = tile_rows * blocks_per_row;
+    const int64_t plane     = tile / tiles_per_plane;
+    const int64_t in_plane  = tile - plane * tiles_per_plane;
+    const int64_t tile_row  = in_plane / blocks_per_row;
+    const int64_t block_col = in_plane - tile_row * blocks_per_row;
+
+    const int row_lo = lane >> 2;
+    const int row_hi = row_lo + 8;
+    const int word   = lane & 3;
+    const int64_t row0 = tile_row * MXFP8_MMA_TILE_ROWS;
+
+    const block_mxfp8 * rows = src + plane * ne1 * blocks_per_row + row0 * blocks_per_row + block_col;
+
+    uint4 packed = make_uint4(0, 0, 0, 0);
+    if (row0 + row_lo < ne1) {
+        const uint32_t * q = reinterpret_cast<const uint32_t *>(rows[row_lo * blocks_per_row].qs[frag]);
+        packed.x = q[word + 0];
+        packed.z = q[word + 4];
+    }
+    if (row0 + row_hi < ne1) {
+        const uint32_t * q = reinterpret_cast<const uint32_t *>(rows[row_hi * blocks_per_row].qs[frag]);
+        packed.y = q[word + 0];
+        packed.w = q[word + 4];
+    }
+    dst[tile].qs[frag][lane] = packed;
+
+    if (lane < MXFP8_MMA_TILE_ROWS) {
+        // padded rows carry zero codes, so their scale only has to be a legal e8m0
+        dst[tile].sc[frag][lane] = row0 + lane < ne1 ? rows[lane * blocks_per_row].e[frag] : 0x7F;
+    }
+}
+
+// inverse permutation, so a repacked weight can still be read back in serialized form
+static __global__ void ggml_cuda_unpack_mxfp8_tiles(
+        const mxfp8_tile * __restrict__ src, block_mxfp8 * __restrict__ dst,
+        const int64_t blocks_per_row, const int64_t tile_rows, const int64_t ne1) {
+    const int     lane = int(threadIdx.x);
+    const int     frag = int(threadIdx.y);
+    const int64_t tile = int64_t(blockIdx.x);
+
+    const int64_t tiles_per_plane = tile_rows * blocks_per_row;
+    const int64_t plane     = tile / tiles_per_plane;
+    const int64_t in_plane  = tile - plane * tiles_per_plane;
+    const int64_t tile_row  = in_plane / blocks_per_row;
+    const int64_t block_col = in_plane - tile_row * blocks_per_row;
+
+    const int row_lo = lane >> 2;
+    const int row_hi = row_lo + 8;
+    const int word   = lane & 3;
+    const int64_t row0 = tile_row * MXFP8_MMA_TILE_ROWS;
+
+    block_mxfp8 * rows = dst + plane * ne1 * blocks_per_row + row0 * blocks_per_row + block_col;
+    const uint4 packed = src[tile].qs[frag][lane];
+
+    if (row0 + row_lo < ne1) {
+        uint32_t * q = reinterpret_cast<uint32_t *>(rows[row_lo * blocks_per_row].qs[frag]);
+        q[word + 0] = packed.x;
+        q[word + 4] = packed.z;
+    }
+    if (row0 + row_hi < ne1) {
+        uint32_t * q = reinterpret_cast<uint32_t *>(rows[row_hi * blocks_per_row].qs[frag]);
+        q[word + 0] = packed.y;
+        q[word + 4] = packed.w;
+    }
+    if (lane < MXFP8_MMA_TILE_ROWS && row0 + lane < ne1) {
+        rows[lane * blocks_per_row].e[frag] = src[tile].sc[frag][lane];
+    }
+}
+
+static bool ggml_backend_cuda_should_repack_mxfp8(
+        ggml_backend_buffer_t buffer, const ggml_tensor * tensor, const int device,
+        const size_t offset, const size_t size) {
+    return blackwell_mma_available(ggml_cuda_info().devices[device].cc) &&
+           tensor->type == GGML_TYPE_MXFP8 &&
+           ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+           tensor->view_src == nullptr && ggml_is_contiguous(tensor) &&
+           offset == 0 && size == ggml_nbytes(tensor);
+}
+
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -942,6 +1031,23 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         return;
     }
     if (ggml_cuda_set_tensor_mxfp6(tensor, data, offset, size, ctx->device)) {
+        return;
+    }
+    if (ggml_backend_cuda_should_repack_mxfp8(buffer, tensor, ctx->device, offset, size)) {
+        void * staging = nullptr;
+        CUDA_CHECK(cudaMalloc(&staging, size));
+        CUDA_CHECK(cudaMemcpyAsync(staging, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+
+        const int64_t nplanes = tensor->ne[2] * tensor->ne[3];
+        const int64_t bpr     = ggml_cuda_mxfp8_blocks_per_row(tensor->ne[0]);
+        const int64_t trows   = ggml_cuda_mxfp8_tile_rows(tensor->ne[1]);
+        const int64_t ntiles  = ggml_cuda_mxfp8_ntiles(tensor->ne[0], tensor->ne[1], nplanes);
+        const dim3 block_dims(32, QK_MXFP8_FRAGS, 1);
+        ggml_cuda_repack_mxfp8_tiles<<<ntiles, block_dims, 0, cudaStreamPerThread>>>(
+            (const block_mxfp8 *) staging, (mxfp8_tile *) tensor->data, bpr, trows, tensor->ne[1]);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        CUDA_CHECK(cudaFree(staging));
         return;
     }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -959,6 +1065,23 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         return;
     }
     if (ggml_cuda_get_tensor_mxfp6(tensor, data, offset, size, ctx->device)) {
+        return;
+    }
+    if (ggml_backend_cuda_should_repack_mxfp8(buffer, tensor, ctx->device, offset, size)) {
+        void * staging = nullptr;
+        CUDA_CHECK(cudaMalloc(&staging, size));
+
+        const int64_t nplanes = tensor->ne[2] * tensor->ne[3];
+        const int64_t bpr     = ggml_cuda_mxfp8_blocks_per_row(tensor->ne[0]);
+        const int64_t trows   = ggml_cuda_mxfp8_tile_rows(tensor->ne[1]);
+        const int64_t ntiles  = ggml_cuda_mxfp8_ntiles(tensor->ne[0], tensor->ne[1], nplanes);
+        const dim3 block_dims(32, QK_MXFP8_FRAGS, 1);
+        ggml_cuda_unpack_mxfp8_tiles<<<ntiles, block_dims, 0, cudaStreamPerThread>>>(
+            (const mxfp8_tile *) tensor->data, (block_mxfp8 *) staging, bpr, trows, tensor->ne[1]);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(data, staging, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        CUDA_CHECK(cudaFree(staging));
         return;
     }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -1129,6 +1252,12 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
+    }
+
+    // MXFP8 weights are stored permuted with the last 16-row tile padded
+    if (tensor->type == GGML_TYPE_MXFP8 && ne0 % QK_MXFP8 == 0) {
+        const size_t tiled = ggml_cuda_mxfp8_tiled_size(ne0, tensor->ne[1], tensor->ne[2] * tensor->ne[3]);
+        size = size > tiled ? size : tiled;
     }
 
     return size;

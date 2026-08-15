@@ -79,6 +79,44 @@ static inline GGML_HD void ggml_cuda_fp8_set4_u8containers(block_fp8 & block, in
     p[3] = (uint8_t) (packed4 >> 24);
 }
 
+#define MXFP8_MMA_TILE_ROWS 16
+#define QK_MXFP8_FRAGS      (QK_MXFP8 / QK_MXFP8_SUB)
+
+struct __align__(16) mxfp8_tile {
+    uint4   qs[QK_MXFP8_FRAGS][32];                  // lane-major A fragments
+    uint8_t sc[QK_MXFP8_FRAGS][MXFP8_MMA_TILE_ROWS]; // one e8m0 per row
+};
+
+static_assert(sizeof(mxfp8_tile) == MXFP8_MMA_TILE_ROWS * sizeof(block_mxfp8),
+              "an MXFP8 tile must stay the size of the 16 blocks it replaces");
+
+static inline __host__ __device__ int64_t ggml_cuda_mxfp8_tile_rows(const int64_t ne1) {
+    return (ne1 + MXFP8_MMA_TILE_ROWS - 1) / MXFP8_MMA_TILE_ROWS;
+}
+
+static inline __host__ __device__ int64_t ggml_cuda_mxfp8_blocks_per_row(const int64_t ne0) {
+    return ne0 / QK_MXFP8;
+}
+
+static inline __host__ __device__ int64_t ggml_cuda_mxfp8_ntiles(
+        const int64_t ne0, const int64_t ne1, const int64_t nplanes) {
+    return nplanes * ggml_cuda_mxfp8_tile_rows(ne1) * ggml_cuda_mxfp8_blocks_per_row(ne0);
+}
+
+static inline __host__ __device__ size_t ggml_cuda_mxfp8_tiled_size(
+        const int64_t ne0, const int64_t ne1, const int64_t nplanes) {
+    return (size_t) ggml_cuda_mxfp8_ntiles(ne0, ne1, nplanes) * sizeof(mxfp8_tile);
+}
+
+// which lane/register of a fragment holds a given row's 4-byte word
+static inline __host__ __device__ int ggml_cuda_mxfp8_frag_lane(const int row, const int word) {
+    return ((row & 7) << 2) + (word & 3);
+}
+
+static inline __host__ __device__ int ggml_cuda_mxfp8_frag_reg(const int row, const int word) {
+    return (row >> 3) + ((word >> 2) << 1);
+}
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
@@ -977,6 +1015,17 @@ __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e)
     }
 
     return static_cast<uint8_t>(best_i | sign_bit);
+}
+
+static __device__ __forceinline__ uint32_t ggml_cuda_e4m3x4_clear_nan(uint32_t x4) {
+    const uint32_t mask_7f = 0x7f7f7f7fu;
+    const uint32_t is_nan = __vcmpeq4(x4 & mask_7f, mask_7f);
+    return x4 & ~is_nan;
+}
+
+static __device__ __forceinline__ float2 ggml_cuda_e4m3x2_to_fp32x2(uint32_t x2) {
+    __nv_fp8x2_storage_t s = uint16_t(x2);
+    return __half22float2(__nv_cvt_fp8x2_to_halfraw2(s, __NV_E4M3));
 }
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
